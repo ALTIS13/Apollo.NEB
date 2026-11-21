@@ -7,6 +7,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -20,7 +21,7 @@ def request(port, method, path, payload=None, cookie=None):
         headers["Content-Type"] = "application/json"
     if cookie:
         headers["Cookie"] = cookie
-    with http.client.HTTPConnection("127.0.0.1", port, timeout=3) as client:
+    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=3)) as client:
         client.request(method, path, json.dumps(payload) if payload is not None else None, headers=headers)
         response = client.getresponse()
         return response.status, response.read(), response.getheader("Set-Cookie")
