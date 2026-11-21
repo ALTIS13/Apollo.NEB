@@ -1,3 +1,4 @@
+from itertools import count
 import json
 import os
 from pathlib import Path
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -60,6 +62,65 @@ class WorkerConfigTests(unittest.TestCase):
         self.assertEqual(argv[-2:], ["-d", "0"])
 
 
+class WorkerJournalTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        workers = [dict(id=ident, adapter="custom", binary="/offline-miner",
+                        args=["{wallet}", "{pool}"], log_format="json-lines")
+                   for ident in ("one", "two")]
+        self.manager = runtime.Manager(workers, Path(scratch.name))
+
+    def record(self, output, clock):
+        with tempfile.TemporaryFile() as stream:
+            stream.write(output)
+            stream.seek(0)
+            process = SimpleNamespace(stdout=stream)
+            # Substitute only Linux launch and poll boundaries. The reader still consumes real bytes.
+            with (patch.object(runtime.sys, "platform", "linux"),
+                  patch.object(runtime, "_trusted_file", return_value=Path("/offline-miner")),
+                  patch.object(runtime, "_spawn_guard", return_value=(process, -1)),
+                  patch.object(runtime.selectors, "DefaultSelector") as selector,
+                  patch.object(runtime, "time", SimpleNamespace(monotonic=clock, time=time.time))):
+                selector.return_value.__enter__.return_value.select.return_value = [True]
+                self.manager.start("one", PROFILE)
+                child = self.manager._live["one"]
+                child.thread.join(timeout=2)
+                self.assertFalse(child.thread.is_alive())
+                with (patch.object(child, "finished", return_value=False),
+                      patch.object(child, "stop", return_value=b"")):
+                    self.manager.stop("one")
+
+    def test_journal_keeps_first_and_latest_observation_from_noisy_miner(self):
+        output = (b"fixture-secret\n" + b"x" * 10000 + b"\n"
+                  b'{"rate_hs":125,"accepted":1,"detail":"fixture-secret"}\n'
+                  + b'{"rate_hs":200}\n' * 180
+                  + b'{"rejected":3}\n{"accepted":42,"wallet":"fixture-address"}\n')
+        self.record(output, lambda: 100)
+        self.assertTrue(callable(getattr(self.manager, "journal", None)), "Configured workers need a journal")
+        rows = self.manager.journal("one")
+        self.assertEqual([row["type"] for row in rows], ["stop", "telemetry", "telemetry", "start"])
+        self.assertEqual({k: v for k, v in rows[1].items() if k != "time"},
+                         {"type": "telemetry", "rate_hs": 200, "accepted": 42, "rejected": 3})
+        self.assertEqual({k: v for k, v in rows[2].items() if k != "time"},
+                         {"type": "telemetry", "rate_hs": 125, "accepted": 1})
+        self.assertTrue(all(isinstance(row["time"], int) for row in rows))
+        self.assertEqual(self.manager.journal("two"), [])
+        with self.assertRaisesRegex(runtime.Refusal, "Unknown worker"):
+            self.manager.journal("missing")
+
+    def test_journal_bounds_sustained_telemetry_to_the_latest_rows(self):
+        output = b"".join(json.dumps({"accepted": i}).encode() + b"\n" for i in range(130))
+        self.record(output, count(100, 10).__next__)
+        self.assertTrue(callable(getattr(self.manager, "journal", None)), "Configured workers need a journal")
+        rows = self.manager.journal("one")
+        self.assertGreater(len(rows), 1)
+        self.assertLessEqual(len(rows), 80)
+        self.assertEqual(rows[0]["type"], "stop")
+        self.assertEqual(rows[1]["accepted"], 129)
+        self.assertGreater(rows[-1]["accepted"], 0)
+
+
 @unittest.skipUnless(sys.platform == "linux", "Linux process and sysfs contracts")
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
@@ -110,6 +171,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("fixture-address", json.dumps([row, manager.drain_events()]))
         manager.stop("test")
         self.assertEqual(manager.snapshot({})[0]["state"], "stopped")
+        self.assertEqual([row["type"] for row in manager.journal("test")], ["stop", "telemetry", "start"])
+        self.assertNotIn("fixture-address", json.dumps(manager.journal("test")))
 
     def test_refuses_credentials_without_spawning(self):
         manager = self.manager()
@@ -127,14 +190,20 @@ class RuntimeTests(unittest.TestCase):
 
     def test_max_seconds_stops_miner_without_panel_polling(self):
         started, lingered = self.root / "leased", self.root / "late"
+        lease, late_marker_delay = 3.0, 4.0
         manager = self.manager(
             "import time\nfrom pathlib import Path\n"
-            f"Path({str(started)!r}).touch()\ntime.sleep(0.9)\nPath({str(lingered)!r}).touch()\n"
+            f"Path({str(started)!r}).touch()\n"
+            f"time.sleep({late_marker_delay})\nPath({str(lingered)!r}).touch()\n"
             "while True: time.sleep(0.02)"
         )
-        manager.start("test", PROFILE, max_seconds=0.4)
-        time.sleep(1.0)
+        manager.start("test", PROFILE, max_seconds=lease)
+        # Observe the fixture's marker without polling the manager.
+        deadline = time.monotonic() + lease
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
         self.assertTrue(started.exists())
+        time.sleep(late_marker_delay + 0.5)
         self.assertFalse(lingered.exists())
         expired = manager.snapshot({})[0]
         self.assertEqual(expired["state"], "stopped")
@@ -193,6 +262,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(row["rate_hs"])
             self.assertTrue(appeared.exists())
             self.assertTrue(any(event["type"] == "exit" for event in manager.drain_events()))
+            self.assertEqual(manager.journal("test")[0]["type"], "exit")
             time.sleep(0.65)
             self.assertFalse(escaped.exists())
             self.assertIsNone(unrelated.poll())
@@ -217,6 +287,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(manager.snapshot({})[0]["state"], "protection")
             self.assertTrue(any(event["type"] == "thermal" and event["status"] == "stopped"
                                 for event in manager.drain_events()))
+            self.assertEqual(manager.journal("test")[0]["type"], "thermal")
 
     def test_thermal_signals_all_cards_before_first_wait_and_exposes_unconfirmed_stop(self):
         other = "0000:05:00.0"

@@ -14,6 +14,8 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from contextlib import closing
 
@@ -22,6 +24,7 @@ sys.path.insert(0, str(HERE))
 
 import neb_app
 import neb_core as core
+from neb_devfee_owner import OwnerPolicy
 import neb_runtime
 import neb_setup
 import neb_release
@@ -39,9 +42,9 @@ def private(path):
     return path
 
 
-def paths(args):
-    cfg = args.config_dir or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "apollo-neb"
-    state = args.state_dir or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "apollo-neb"
+def paths(args, name="apollo-neb"):
+    cfg = args.config_dir or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / name
+    state = args.state_dir or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / name
     if (not cfg.is_absolute() or not state.is_absolute() or cfg != cfg.resolve() or state != state.resolve()
             or cfg == state or cfg in state.parents or state in cfg.parents):
         raise ValueError("Каталоги настроек и состояния должны быть отдельными абсолютными путями без ссылок.")
@@ -54,8 +57,8 @@ def settings_path(cfg):
 
 def release_support():
     policy = core.read(HERE / "developer-support.json", {})
-    if not isinstance(policy, dict) or policy.get("basis_points") != 50:
-        raise ValueError("Установите целый официальный пакет с политикой DevFee 0,5%.")
+    if not isinstance(policy, dict) or policy.get("basis_points") != core.DEVFEE_BASIS_POINTS:
+        raise ValueError("Установите полный официальный пакет Apollo.NEB.")
     return core.support_config({"enabled": True, "basis_points": policy["basis_points"], "wallet": policy.get("wallet")})
 
 
@@ -132,7 +135,7 @@ def configure_locked(args, cfg, state):
     core.store(cfg / "workers.json", workers)
     core.store(cfg / "limits.json", limits)
     print(f"Настройки: {cfg}\nАдрес панели: http://127.0.0.1:{port}\nВоркеров: {len(workers)}. Майнинг не запущен.")
-    print(f"DevFee: 0,5% активного времени; {support['wallet']}")
+    print("DevFee: 1,1% активного времени майнинга.")
     enroll(enrollment)
 
 
@@ -178,6 +181,19 @@ def rotate_password(args):
         print("Пароль обновлён. Прежние сессии отозваны.")
 
 
+def linux_boot():
+    try:
+        boot_id = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()))
+    except (OSError, ValueError):
+        return None, None
+    try:
+        with Path("/proc/stat").open(encoding="ascii") as stats:
+            reboot_at = next((int(line.split()[1]) for line in stats if line.startswith("btime ")), None)
+    except (OSError, ValueError, IndexError):
+        reboot_at = None
+    return boot_id, reboot_at
+
+
 def serve(args):
     import neb_fleet
     cfg, state = paths(args)
@@ -201,9 +217,14 @@ def serve(args):
                                   setup=neb_setup.Setup(state),wallets=neb_wallet.WalletStore(state),
                                   releases=neb_release.Releases(),fleet=neb_fleet.Fleet(state/"fleet.sqlite"))
         server = neb_app.Server(("127.0.0.1", port), service, auth, HERE / "web", settings.get("origin"))
+        boot_id, reboot_at = linux_boot()
+        service.archive.note_start(int(time.time()), boot_id=boot_id, reboot_at=reboot_at)
         service.poll()
         background = threading.Thread(target=service.loop, name="neb-monitor", daemon=True)
         background.start()
+        fee_monitor = threading.Thread(target=service.devfee.loop, args=(service.stopping,),
+                                      name="neb-devfee", daemon=True)
+        fee_monitor.start()
         link = core.read(cfg/"fleet-link.json")
         if isinstance(link,dict) and link.get("paired") is True:
             follower = neb_fleet.Client(link["origin"],link["id"],link["key"],link_receipts(state,link),
@@ -223,6 +244,40 @@ def serve(args):
             service.close()
             server.server_close()
             background.join(timeout=3)
+
+
+def devfee_owner(args):
+    cfg, state = paths(args, "apollo-neb-devfee")
+    private(cfg)
+    private(state)
+    with lock_state(state):
+        login_path = cfg / "owner-login.json"
+        settings_file = cfg / "owner-settings.json"
+        login = core.read(login_path)
+        if args.owner_action == "configure":
+            port = args.port
+            if not 1024 <= port <= 65535:
+                raise ValueError("Укажите допустимый непривилегированный порт.")
+            origin = neb_app.validated_origin(args.origin)
+            if login is None:
+                login, key = prompt_login(args)
+                core.store(login_path, login)
+                enroll(key)
+            core.store(settings_file, {"origin": origin, "port": port})
+            print(f"Панель владельца DevFee: http://127.0.0.1:{port}")
+            return
+        settings = core.read(settings_file)
+        if login is None or settings is None:
+            raise ValueError("Сначала выполните apollo-neb devfee-owner configure.")
+        auth = core.Auth(login, state / "owner-auth.sqlite")
+        owner = OwnerPolicy(state / "devfee-policy.json")
+        if args.enroll and auth.is_totp_enabled():
+            raise ValueError("2FA владельца уже настроена.")
+        origin = None if args.enroll else settings["origin"]
+        with neb_app.Server(("127.0.0.1", settings["port"]), None, auth, HERE / "web", origin,
+                            owner=owner, owner_enrollment=args.enroll) as server:
+            print(f"Панель владельца DevFee: http://127.0.0.1:{server.server_port}", flush=True)
+            server.serve_forever(poll_interval=0.4)
 
 
 def node_loop(service, follower):
@@ -277,7 +332,7 @@ def main():
     parser.add_argument("--state-dir", type=Path, help="явный путь вместо XDG_STATE_HOME")
     sub = parser.add_subparsers(dest="action", required=True)
     command = sub.add_parser("configure", help="проверить и сохранить параметры",
-                             description="Официальный пакет использует DevFee 0,5% активного времени. Майнинг запускаете вы.")
+                             description="DevFee 1,1% активного времени. Майнинг запускаете вы.")
     command.add_argument("--wallet", help="публичный адрес NEB Mainnet")
     command.add_argument("--worker", help="метка воркера в пуле")
     command.add_argument("--pool", help="идентификатор из pools.json")
@@ -293,6 +348,15 @@ def main():
     command.add_argument("--password-stdin", action="store_true")
     sub.add_parser("devices", help="показать обнаруженные PCI GPU и доступность показаний")
     sub.add_parser("serve", help="запустить локальную панель без автоматического запуска воркеров")
+    owner = sub.add_parser("devfee-owner", help="изолированная панель владельца для паузы DevFee")
+    owner_sub = owner.add_subparsers(dest="owner_action", required=True)
+    owner_setup = owner_sub.add_parser("configure", help="настроить отдельный вход владельца с 2FA")
+    owner_setup.add_argument("--port", type=int, default=18764)
+    owner_setup.add_argument("--origin", help="внешний HTTPS origin панели владельца")
+    owner_setup.add_argument("--password-stdin", action="store_true")
+    owner_setup.set_defaults(totp=False)
+    owner_serve = owner_sub.add_parser("serve", help="запустить панель управления и публичное чтение состояния")
+    owner_serve.add_argument("--enroll", action="store_true", help="привязать 2FA из браузера на loopback")
     command = sub.add_parser("upgrade",help="проверить официальный релиз; установка только с --apply")
     command.add_argument("--apply",action="store_true")
     command.add_argument("--service",action="store_true",help="запустить пользовательскую службу после установки")
@@ -312,6 +376,8 @@ def main():
             rotate_password(args)
         elif args.action == "devices":
             print(json.dumps(neb_runtime.discover_devices(), ensure_ascii=False, indent=2))
+        elif args.action == "devfee-owner":
+            devfee_owner(args)
         elif args.action == "node-pair":
             pair_node(args)
         elif args.action == "node-unpair":

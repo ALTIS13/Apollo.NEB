@@ -12,14 +12,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import neb_core as core
+from neb_devfee import DevFeePolicy
 from neb_fleet import FleetAuthError
-from neb_history import Archive
+from neb_history import Archive, observations, value
+from neb_network import Network
 
 HERE = Path(__file__).resolve().parent
 
 
 class Service:
-    def __init__(self, config, state, runtime, pools, support, *, setup=None, wallets=None, releases=None, fleet=None):
+    def __init__(self, config, state, runtime, pools, support, *, setup=None, wallets=None, releases=None, fleet=None,
+                 devfee=None):
         self.config, self.runtime = config, runtime
         self.lock, self.stopping = threading.RLock(), threading.Event()
         self.archive = Archive(state / "history.sqlite")
@@ -29,6 +32,8 @@ class Service:
             self.pools, allow_empty=True)
         self.limits = core.limits(core.read(config / "limits.json", core.LIMITS))
         self.clock = core.SupportClock(core.support_config(support), state / "support-time.json")
+        self.devfee = devfee if devfee is not None else DevFeePolicy()
+        self.network = Network()
         if self.clock.cfg["enabled"] and self.clock.cfg["wallet"] == self.profile["wallet"]:
             raise ValueError("Адрес добычи должен отличаться от адреса поддержки.")
         self.last, self.rows = 0, []
@@ -73,7 +78,7 @@ class Service:
     def persist(self, at):
         pending = [*self.events, *self.runtime.drain_events()]
         self.events = pending
-        self.archive.tick(at, self.rows, pending)
+        self.archive.tick(at, self.rows, pending, limits=self.limits)
         self.events = []
 
     def launch(self, id_, address, **options):
@@ -90,6 +95,7 @@ class Service:
                 if command == "stop":
                     self.runtime.stop(id_)
                     self.clock.finish(id_)
+                    self.suspended_support.discard(id_)
                 else:
                     self.launch(id_, self.profile["wallet"])
                     self.suspended_support.discard(id_)
@@ -157,6 +163,7 @@ class Service:
             self.rows = self.runtime.snapshot(self.limits)
             changed = False
             monotonic = time.monotonic()
+            fee_enabled = self.devfee.state() == "enabled"
             rows = sorted(self.rows, key=lambda row: row["id"] not in self.clock.deadline)
             for row in rows:
                 id_, running = row["id"], row["state"] == "running"
@@ -173,7 +180,9 @@ class Service:
                     # On thermal failure only verify/stop; never restart automatically.
                     self.suspended_support.add(id_)
                 # Every managed adapter passes the chosen wallet to its miner.
-                target = self.clock.observe(id_, running, monotonic)
+                target = self.clock.observe(id_, running and fee_enabled, monotonic)
+                if running and not fee_enabled and id_ in self.clock.deadline:
+                    target = "operator"
                 if target == "operator" and id_ in self.suspended_support:
                     # Retry only the stop, never an uncertain replacement.
                     try:
@@ -210,11 +219,53 @@ class Service:
         with self.lock:
             active = [row["id"] for row in self.rows if row["state"] == "running"
                       and row["id"] in self.clock.deadline]
-            failed = self.suspended_support or self.support_checkpoint_failed
-            support_state = "disabled" if not self.clock.cfg["enabled"] else "degraded" if failed else "online"
+            policy = self.devfee.state()
+            if not self.clock.cfg["enabled"]:
+                support_state = "disabled"
+            elif active:
+                support_state = "active"
+            elif self.suspended_support or self.support_checkpoint_failed:
+                support_state = "unavailable"
+            elif policy != "enabled":
+                support_state = policy
+            else:
+                support_state = "counting" if any(row["state"] == "running" for row in self.rows) else "idle"
             return {"time": self.last, "workers": self.rows, "profile": self.profile,
                     "pools": [{"id": p["id"], "label": p["label"]} for p in self.pools.values()],
-                    "limits": self.limits, "support": {**self.clock.cfg, "active_workers": active, "state": support_state}}
+                    "limits": self.limits, "support": {"enabled": self.clock.cfg["enabled"],
+                    "basis_points": self.clock.cfg["basis_points"], "active_workers": active, "state": support_state}}
+
+    def network_status(self, *, refresh=False):
+        stats = self.network.refresh() if refresh else self.network.status()
+        data = stats["data"]
+        rate = self.archive.recent_rate_hs() if stats["state"] == "fresh" else None
+        estimate = None
+        if rate is not None and data["difficulty"] >= 1:
+            estimate = rate * 86400 / data["difficulty"] * data["reward_neb"]
+        return {**stats, "local_rate_hs": rate, "estimate_neb_day": estimate}
+
+    def public_status(self):
+        status = self.status()
+        rows = status["workers"]
+        active = [row for row in rows if row["state"] == "running"]
+        rate, watts, *_ = observations(rows)
+        temperatures = {}
+        for key in ("edge", "hot", "hbm"):
+            readings = [n for row in rows if row.get("device") and (n := value(row.get(key))) is not None]
+            temperatures[key] = max(readings, default=None)
+        shares = {}
+        for key in ("accepted", "rejected"):
+            readings = [value(row.get(key)) for row in active]
+            shares[key] = sum(readings) if readings and None not in readings else None
+        return {
+            "time": status["time"],
+            "workers": {"total": len(rows), "running": len(active),
+                        "attention": sum(row["state"] in {"protection", "failed", "blocked", "unavailable"}
+                                         for row in rows)},
+            "hashrate_hs": rate * 1e6 if rate is not None else None,
+            "watts": watts, "temperatures": temperatures, "shares": shares,
+            "devfee": {key: status["support"][key] for key in ("enabled", "basis_points", "state")},
+        }
 
     def close(self):
         self.stopping.set()
@@ -240,20 +291,32 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 32
 
-    def __init__(self, address, service, auth, web_dir, origin):
+    def __init__(self, address, service, auth, web_dir, origin, *, owner=None, owner_enrollment=False):
         if address[0] != "127.0.0.1":
             raise ValueError("Прямой доступ разрешён только с loopback.")
         self.service, self.auth, self.public_origin = service, auth, validated_origin(origin)
+        self.owner, self.owner_enrollment = owner, owner_enrollment
+        if owner_enrollment and (owner is None or self.public_origin is not None):
+            raise ValueError("Привязка 2FA владельца доступна только на loopback.")
+        if owner is not None and not owner_enrollment and not auth.is_totp_enabled():
+            raise ValueError("Для управления DevFee настройте вход с 2FA.")
         self.active_requests = threading.BoundedSemaphore(24)
         self.assets = {}
-        for route, file, mime in (("/", "index.html", "text/html; charset=utf-8"),
+        entry, script = ("devfee.html", "devfee.js") if owner is not None else ("index.html", "ui.js")
+        for route, file, mime in (("/", entry, "text/html; charset=utf-8"),
                                   ("/ui.css", "ui.css", "text/css; charset=utf-8"),
-                                  ("/ui.js", "ui.js", "text/javascript; charset=utf-8"),
+                                  ("/ui.js", script, "text/javascript; charset=utf-8"),
                                   ("/brand.svg", "brand.svg", "image/svg+xml"),
                                   ("/favicon.ico", "brand.svg", "image/svg+xml"),
+                                  ("/recovery-codes.js", "recovery-codes.js", "text/javascript; charset=utf-8"),
                                   ("/qr.js", "qr.js", "text/javascript; charset=utf-8")):
             if route in ("/","/ui.css","/ui.js") or (web_dir / file).is_file():
                 self.assets[route] = ((web_dir / file).read_bytes(), mime)
+        if owner is None:
+            self.assets["/view"] = ((web_dir / "view.html").read_bytes(), "text/html; charset=utf-8")
+            self.assets["/view.js"] = ((web_dir / "view.js").read_bytes(), "text/javascript; charset=utf-8")
+            self.assets["/live-metrics.js"] = ((web_dir / "live-metrics.js").read_bytes(), "text/javascript; charset=utf-8")
+            self.assets["/history-chart.js"] = ((web_dir / "history-chart.js").read_bytes(), "text/javascript; charset=utf-8")
         super().__init__(address, Handler)
         host = f"127.0.0.1:{self.server_port}"
         self.origins = {host: "http://" + host}
@@ -314,14 +377,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def token(self):
         try:
-            session = SimpleCookie(self.headers.get("Cookie", "")).get("neb_sid")
+            name = "neb_devfee_sid" if self.server.owner is not None else "neb_sid"
+            session = SimpleCookie(self.headers.get("Cookie", "")).get(name)
             return session.value if session else None
         except CookieError:
             return None
 
     def cookie(self, token, age):
         secure = "; Secure" if self.origin().startswith("https://") else ""
-        return f"neb_sid={token}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}"
+        name = "neb_devfee_sid" if self.server.owner is not None else "neb_sid"
+        path = "/devfee/" if self.server.owner is not None and secure else "/"
+        return f"{name}={token}; Path={path}; Max-Age={age}; HttpOnly; SameSite=Strict{secure}"
 
     def do_GET(self):
         if self.origin() is None:
@@ -333,15 +399,35 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == "/favicon.ico":
             return self.respond(204, b"")
         try:
+            owner = self.server.owner
+            if owner is not None and path.path == "/policy":
+                if self.server.owner_enrollment:
+                    return self.fail(404, "Политика недоступна в режиме привязки 2FA.")
+                return self.respond(200, owner.status())
             if path.path == "/api/auth/info":
-                return self.respond(200, {"totp": self.server.auth.is_totp_enabled()})
+                info = {"totp": self.server.auth.is_totp_enabled()}
+                if owner is not None:
+                    info["enrollment"] = self.server.owner_enrollment
+                return self.respond(200, info)
+            if owner is None and path.path == "/api/public/status":
+                return self.respond(200, self.server.service.public_status())
             if not self.server.auth.valid(self.token()):
                 return self.fail(401, "Войдите в панель.")
+            if owner is not None:
+                if not self.server.owner_enrollment and path.path == "/api/devfee":
+                    return self.respond(200, owner.status())
+                return self.fail(404, "Страница не найдена.")
             service = self.server.service
             if path.path == "/api/status":
                 return self.respond(200, service.status())
             if path.path == "/api/events":
-                return self.respond(200, {"events": service.archive.events()})
+                kind = parse_qs(path.query, max_num_fields=1).get("kind", [None])[0]
+                return self.respond(200, {"events": service.archive.events(kind=kind)})
+            if path.path == "/api/logs":
+                worker = parse_qs(path.query, max_num_fields=1).get("worker", [None])[0]
+                return self.respond(200, {"entries": service.runtime.journal(worker)})
+            if path.path == "/api/network":
+                return self.respond(200, service.network_status())
             if path.path == "/api/setup" and service.setup:
                 return self.respond(200, service.setup.status(len(service.status()["workers"])))
             if path.path == "/api/wallets" and service.wallets:
@@ -379,7 +465,7 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         try:
             if is_node:
-                if not service.fleet or self.headers.get("Cookie"):
+                if self.server.owner is not None or not service.fleet or self.headers.get("Cookie"):
                     return self.fail(403, "Подключение ноды недоступно.")
                 if self.path.endswith("/pair"):
                     reply = service.fleet.pair(body.get("id"),body.get("code"),body.get("key"))
@@ -397,6 +483,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/logout":
                 auth.revoke(token)
                 return self.respond(200, {"ok": True}, cookie=self.cookie("", 0))
+            if self.server.owner is not None:
+                if not self.server.owner_enrollment and self.path == "/api/devfee" and set(body) == {"paused"}:
+                    return self.respond(200, self.server.owner.set_paused(body["paused"]))
+                if not self.server.owner_enrollment or self.path not in ("/api/auth/totp/begin", "/api/auth/totp/confirm"):
+                    return self.fail(404, "Действие не найдено.")
             if self.path == "/api/auth/totp/begin":
                 return self.respond(200, auth.begin_enrollment(token,body.get("password")))
             if self.path == "/api/auth/totp/confirm":
@@ -419,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200,service.wallets.create(body.get("label"),body.get("password")))
             if self.path == "/api/wallets/export" and service.wallets:
                 return self.respond(200,service.wallets.export(body.get("id"),body.get("password")))
+            if self.path == "/api/network/refresh":
+                return self.respond(200, service.network_status(refresh=True))
             if service.fleet:
                 if self.path == "/api/fleet/enroll":
                     return self.respond(200,service.fleet.enroll(body.get("label")))

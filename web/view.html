@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Наблюдение · Apollo.NEB</title>
+  <link rel="icon" type="image/svg+xml" href="/brand.svg">
+  <link rel="stylesheet" href="/ui.css">
+  <script src="/live-metrics.js" defer></script>
+  <script src="/view.js" defer></script>
+</head>
+<body class="public-view">
+  <a href="#main" class="skip">К содержимому</a>
+  <header class="top">
+    <div class="frame top-inner">
+      <div class="brand">
+        <img src="/brand.svg" width="33" height="33" alt="">
+        <span>Apollo<span class="brand-suffix">.NEB</span></span>
+      </div>
+      <a class="public-login" href="/">Войти в панель</a>
+    </div>
+  </header>
+
+  <main class="frame public-main" id="main" tabindex="-1">
+    <div class="page-header public-heading">
+      <h1>Мониторинг фермы</h1>
+      <div class="public-freshness">
+        <span class="connection" id="view-connection" data-tone="neutral">
+          <i aria-hidden="true"></i><span id="view-connection-label" role="status">Загружаем показатели…</span>
+        </span>
+        <time class="mono muted" id="view-time" hidden></time>
+      </div>
+    </div>
+
+    <dl class="surface summary public-summary" aria-label="Сводка фермы">
+      <div><dt>Хешрейт</dt><dd id="view-hashrate">—</dd></div>
+      <div><dt>Потребление GPU</dt><dd id="view-watts">—</dd></div>
+      <div><dt>Воркеры в работе</dt><dd id="view-workers">—</dd></div>
+      <div><dt>Требуют внимания</dt><dd id="view-attention">—</dd></div>
+    </dl>
+
+    <div class="public-details">
+      <section class="surface" aria-labelledby="view-thermal-title">
+        <h2 id="view-thermal-title">Температура GPU</h2>
+        <p class="subline">Максимум по доступным датчикам</p>
+        <dl class="sensor-list">
+          <div><dt>Ядро</dt><dd id="view-edge">—</dd></div>
+          <div><dt>Hotspot</dt><dd id="view-hot">—</dd></div>
+          <div><dt>Память</dt><dd id="view-hbm">—</dd></div>
+        </dl>
+      </section>
+      <section class="surface" aria-labelledby="view-shares-title">
+        <h2 id="view-shares-title">Шары</h2>
+        <dl class="sensor-list">
+          <div><dt>Приняты</dt><dd id="view-accepted">—</dd></div>
+          <div><dt>Отклонены</dt><dd id="view-rejected">—</dd></div>
+        </dl>
+      </section>
+      <section class="surface" aria-labelledby="view-devfee-title">
+        <h2 id="view-devfee-title">DevFee</h2>
+        <dl class="sensor-list">
+          <div><dt>Состояние</dt><dd id="view-devfee-state">—</dd></div>
+          <div><dt>Доля активного времени</dt><dd id="view-devfee-share">—</dd></div>
+        </dl>
+      </section>
+    </div>
+    <noscript><p>Включите JavaScript, чтобы видеть текущие показатели.</p></noscript>
+  </main>
+</body>
+</html>

@@ -9,6 +9,9 @@
   <link rel="icon" type="image/svg+xml" href="/brand.svg">
   <link rel="stylesheet" href="/ui.css">
   <script src="/qr.js" defer></script>
+  <script src="/live-metrics.js" defer></script>
+  <script src="/recovery-codes.js" defer></script>
+  <script src="/history-chart.js" defer></script>
   <script src="/ui.js" defer></script>
 </head>
 <body>
@@ -30,7 +33,7 @@
       <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 18V6l14 12V6M9 18v-5m6-2V6"/></svg></span><span>Apollo<span class="brand-suffix">.NEB</span></span></div>
       <div class="top-tools">
         <span class="connection" id="connection" data-tone="neutral"><i></i><span id="connection-label">Подключение…</span></span>
-        <span class="connection devfee" id="devfee" title="0,5% активного времени майнинга выделяется автору" hidden><i aria-hidden="true"></i><span id="devfee-label" role="status"></span></span>
+        <span class="connection devfee" id="devfee" hidden><i aria-hidden="true"></i><span id="devfee-label" role="status"></span></span>
         <button type="button" class="quiet" id="logout" hidden>Выйти</button>
       </div>
     </div>
@@ -54,6 +57,7 @@
         <button class="primary" type="submit">Войти</button>
         <p id="login-message" class="form-message" role="status"></p>
       </form>
+      <p class="panel-actions"><a href="/view">Смотреть состояние без входа</a></p>
     </section>
     <div id="app" hidden>
       <div class="page-header">
@@ -106,15 +110,15 @@
           <section class="surface history" aria-labelledby="history-title">
             <div class="panel-head"><div><h2 id="history-title">История фермы</h2><p>Локальные измерения</p></div><span class="mono muted" id="history-count"></span></div>
             <div class="chart-controls">
-              <label>Период <select id="period"><option value="30m">30 минут</option><option value="6h">6 часов</option><option value="24h">24 часа</option><option value="7d">7 дней</option><option value="30d">30 дней</option></select></label>
+              <label>Период <select id="period"><option value="30m">30 минут</option><option value="6h">6 часов</option><option value="24h">24 часа</option><option value="7d">7 дней</option><option value="31d">31 день</option></select></label>
               <label>Метрика <select id="metric"><option value="rate">Хешрейт</option><option value="watts">Потребление GPU</option><option value="edge">Ядро · средняя</option><option value="hot">Hotspot · максимум</option><option value="hbm">Память · средняя</option><option value="active">Активные воркеры</option><option value="efficiency">Эффективность GPU</option></select></label>
             </div>
             <div id="chart-wrap" class="chart-wrap">
-              <svg id="chart-svg" role="img" aria-label="История хешрейта"></svg>
+              <svg id="chart-svg" role="group" aria-label="История хешрейта" aria-describedby="chart-caption"></svg>
               <p id="chart-empty" class="chart-empty">Загружаем историю…</p>
             </div>
             <p class="chart-help" id="chart-caption">Пропуск означает, что данных не было.</p>
-            <div class="chart-incidents" id="chart-incidents" hidden><span class="event-key"><i></i>Термозащита</span><div id="incident-list"></div></div>
+            <div class="chart-incidents" id="chart-incidents" hidden><span class="event-key">События на графике</span><div id="incident-list"></div></div>
           </section>
           <div class="overview-side">
             <section class="surface thermal" aria-labelledby="thermal-title">
@@ -125,8 +129,18 @@
             <section id="support" class="surface support" aria-labelledby="support-title" hidden>
               <div class="panel-head"><h2 id="support-title">DevFee · поддержка автора</h2></div>
               <p id="support-summary"></p>
-              <p id="support-recipient" class="mono"></p>
               <p id="support-active" class="muted"></p>
+            </section>
+            <section class="surface network" aria-labelledby="network-title">
+              <div class="panel-head"><h2 id="network-title">Сеть NEB Mainnet</h2></div>
+              <dl id="network-stats" class="network-stats" hidden>
+                <div><dt>Высота блока</dt><dd id="network-height">—</dd></div>
+                <div><dt>Хешрейт сети</dt><dd id="network-hashrate">—</dd></div>
+                <div><dt>Оценка за сутки</dt><dd id="network-estimate">—</dd></div>
+                <div><dt>Награда майнеру за блок</dt><dd id="network-reward">—</dd></div>
+              </dl>
+              <p id="network-message" class="subline" role="status">Данные Suprnova загружаются по запросу.</p>
+              <div class="panel-actions"><button type="button" id="network-check">Обновить данные сети</button></div>
             </section>
             <section class="surface release" aria-labelledby="release-title">
               <div class="panel-head"><div><h2 id="release-title">Релизы</h2><p>Обновления устанавливаются вручную.</p></div></div>
@@ -172,7 +186,7 @@
       </section>
       <section id="events" hidden>
         <div class="surface">
-          <div class="panel-head events-head"><div><h2>Журнал панели</h2><p>Действия оператора и события воркеров.</p></div><label>Тип события <select id="event-filter"><option value="">Все события</option><option value="thermal">Термозащита</option><option value="start">Запуск</option><option value="stop">Остановка</option><option value="exit">Завершение</option><option value="support">Поддержка</option><option value="profile">Профиль</option><option value="limits">Температурные пределы</option></select></label></div>
+          <div class="panel-head events-head"><div><h2>Журнал панели</h2><p>Действия оператора и события воркеров.</p></div><label>Тип события <select id="event-filter"><option value="">Все события</option><option value="thermal">Термозащита</option><option value="host-reboot">Перезагрузка узла</option><option value="service-start">Запуск панели</option><option value="start">Запуск воркера</option><option value="stop">Остановка</option><option value="exit">Завершение</option><option value="support">Поддержка</option><option value="profile">Профиль</option><option value="limits">Температурные пределы</option></select></label></div>
           <p id="events-empty" class="empty-text">Загружаем события…</p>
           <ol id="event-list" class="event-list"></ol>
         </div>
@@ -180,6 +194,12 @@
     </div>
   </main>
   <footer class="frame foot"><span>Apollo.NEB</span><span>Локальная панель · время браузера</span></footer>
+  <dialog id="worker-log-dialog" aria-labelledby="worker-log-title">
+    <div class="dialog-head"><h2 id="worker-log-title">Журнал воркера</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p id="worker-log-name" class="subline"></p>
+    <p id="worker-log-message" class="subline" role="status"></p>
+    <ol id="worker-log-entries" class="worker-log" aria-label="Записи журнала" tabindex="0" hidden></ol>
+  </dialog>
   <dialog id="totp-dialog" aria-labelledby="totp-title">
     <div class="dialog-head"><h2 id="totp-title">Защита входа</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <p id="totp-status" role="status"></p>
@@ -200,7 +220,10 @@
     <div id="totp-recovery" hidden>
       <p>Сохраните резервные коды в безопасном месте. Каждый подходит для одного входа. Панель больше не покажет этот список.</p>
       <ul id="totp-codes" class="recovery-codes"></ul>
-      <button type="button" id="totp-recovery-copy">Скопировать резервные коды</button>
+      <div class="dialog-actions panel-actions">
+        <button type="button" class="primary" id="totp-recovery-download" hidden>Скачать коды (.md)</button>
+        <button type="button" id="totp-recovery-copy">Скопировать резервные коды</button>
+      </div>
     </div>
     <form id="totp-disable" class="inner-form" hidden>
       <h3>Отключить 2FA для локального входа</h3>
@@ -308,7 +331,7 @@ apollo-neb configure --help</code><button type="button" class="quiet" data-copy 
       </dl>
       <p data-field="shares" class="worker-shares"></p>
       <p data-field="message" class="worker-message"></p>
-      <div class="worker-actions"><button type="button" class="primary" data-worker-action="start">Запустить</button><button type="button" class="stop-button" data-worker-action="stop">Остановить</button></div>
+      <div class="worker-actions"><button type="button" class="primary" data-worker-action="start">Запустить</button><button type="button" class="stop-button" data-worker-action="stop">Остановить</button><button type="button" data-worker-log>Журнал</button></div>
     </article>
   </template>
   <noscript><p class="frame">Для работы с панелью нужен JavaScript.</p></noscript>

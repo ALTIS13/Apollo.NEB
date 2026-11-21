@@ -5,6 +5,9 @@ const all = selector => [...document.querySelectorAll(selector)];
 const n = (value, digits = 1) => Number.isFinite(value)
   ? value.toLocaleString("ru-RU", {maximumFractionDigits: digits}) : "—";
 const fmt = (value, unit, digits) => Number.isFinite(value) ? `${n(value, digits)} ${unit}` : "—";
+const temperature = value => Number.isFinite(value) ? fmt(Math.floor(value), "°C", 0) : "—";
+const showTemperature = (element, value) => showLiveReading(element, temperature(value),
+  Number.isFinite(value) ? Math.floor(value) : null);
 const inList = value => Array.isArray(value) ? value : [];
 const localTime = (stamp, options) => Number.isFinite(stamp)
   ? new Date(stamp * 1000).toLocaleString("ru-RU", options) : "—";
@@ -37,7 +40,16 @@ const EVENTS = new Map([
   ["start", "Запуск"], ["stop", "Остановка"], ["thermal", "Термозащита"],
   ["exit", "Завершение"], ["support", "Поддержка автора"],
   ["profile", "Профиль"], ["limits", "Температурные пределы"],
+  ["host-reboot", "Перезагрузка узла"], ["service-start", "Запуск панели"],
 ]);
+const DEVFEE = {
+  idle: ["Ожидает запуска", "neutral", "DevFee начнёт учитывать время после запуска воркера."],
+  counting: ["Учёт времени", "good", "Сейчас добыча идёт на адрес оператора."],
+  active: ["В работе", "good", ""],
+  paused: ["На паузе", "neutral", "Владелец Apollo.NEB поставил DevFee на паузу."],
+  unavailable: ["Недоступна", "warn", "Не удалось подтвердить работу DevFee. Проверьте журнал событий."],
+  offline: ["Нет связи", "warn", "Нет свежих данных о воркерах."],
+};
 const PAGES = {overview: "Обзор фермы", workers: "Воркеры", nodes: "Ноды", events: "События"};
 const isRunning = worker => worker.state === "running" || worker.state === "mining";
 const rate = value => !Number.isFinite(value) ? "—" : value >= 1e6
@@ -50,6 +62,7 @@ const state = {
   mode: "boot", view: "overview", status: null, generation: 0,
   history: null, historyError: "", events: null, eventsError: "",
   eventsKey: "", chartKey: "", incidentsKey: "", poll: null, pollAgain: false,
+  eventsKind: null, focusEvent: null,
   timelineSeq: 0, online: false, actions: new Set(),
   authTotp: null, authInfoSeq: 0, authMutation: false, authEpoch: 0,
   selected: new Set(), groupBusy: false,
@@ -59,6 +72,8 @@ const vault = {seq: 0, busy: false, data: null, exportId: null};
 const setup = {seq: 0, busy: false, data: null, selected: new Set()};
 const totp = {seq: 0, busy: false, timer: null, expiresAt: 0};
 const fleet = {generation: 0, loading: false, busy: false, fresh: false, nodes: null, key: "", selected: new Map(), revokeId: null, inviteTimer: null};
+const workerLog = {id: null, request: null, key: ""};
+const network = {data: null, request: null, error: ""};
 let releaseSeq = 0;
 
 class ApiError extends Error {
@@ -110,6 +125,12 @@ function showLogin(expired = false) {
   state.mode = "login";
   state.view = "overview";
   state.status = state.history = state.events = null;
+  state.eventsKind = state.focusEvent = null;
+  Object.assign(workerLog, {id: null, request: null, key: ""});
+  $("worker-log-entries").replaceChildren();
+  for (const id of ["live-rate", "live-watts"]) showLiveReading($(id), "—", null);
+  Object.assign(network, {data: null, request: null, error: ""});
+  renderNetwork();
   state.historyError = state.eventsError = state.chartKey = state.eventsKey = state.incidentsKey = "";
   state.online = state.pollAgain = false;
   state.actions.clear();
@@ -117,7 +138,8 @@ function showLogin(expired = false) {
   state.groupBusy = state.authMutation = false;
   resetAuxiliary();
   cards.clear();
-  for (const id of ["worker-grid", "event-list", "chart-svg", "incident-list", "live-thermal"]) $(id).replaceChildren();
+  clearHistoryPlot($("chart-svg"));
+  for (const id of ["worker-grid", "event-list", "incident-list", "live-thermal"]) $(id).replaceChildren();
   for (const id of ["profile-form", "limits-form", "login-form"]) $(id).reset();
   for (const dialog of all("dialog[open]")) dialog.close();
   $("boot").hidden = $("app").hidden = $("logout").hidden = $("devfee").hidden = true;
@@ -151,6 +173,7 @@ function workerCards(workers) {
       const start = el.querySelector('[data-worker-action="start"]');
       const stop = el.querySelector('[data-worker-action="stop"]');
       const select = el.querySelector("[data-worker-select]");
+      const log = el.querySelector("[data-worker-log]");
       select.addEventListener("change", () => {
         if (select.checked) state.selected.add(worker.id);
         else state.selected.delete(worker.id);
@@ -158,23 +181,25 @@ function workerCards(workers) {
       });
       start.addEventListener("click", () => workerAction(worker.id, "start"));
       stop.addEventListener("click", () => workerAction(worker.id, "stop"));
-      entry = {el, fields, start, stop, select};
+      log.addEventListener("click", () => openWorkerLog(worker.id));
+      entry = {el, fields, start, stop, select, log};
       cards.set(worker.id, entry);
       $("worker-grid").append(el);
     }
-    const {el, fields, start, stop, select} = entry;
+    const {el, fields, start, stop, select, log} = entry;
     const [label, tone] = STATES.get(worker.state) || ["Неизвестно", "neutral"];
     el.dataset.tone = tone;
     text(fields.label, worker.label || worker.id);
     select.setAttribute("aria-label", "Выбрать " + (worker.label || worker.id));
+    log.setAttribute("aria-label", "Журнал: " + (worker.label || worker.id));
     select.checked = state.selected.has(worker.id);
     select.disabled = state.groupBusy || state.actions.has(worker.id);
     text(fields.device, [worker.device, worker.adapter].filter(Boolean).join(" · ") || "Устройство не указано");
     text(fields.state, state.actions.has(worker.id) ? "Выполняется…" : label);
-    text(fields.rate, rate(worker.rate_hs));
-    text(fields.watts, fmt(worker.watts, "Вт"));
+    showLiveReading(fields.rate, rate(worker.rate_hs), worker.rate_hs);
+    showLiveReading(fields.watts, fmt(worker.watts, "Вт"), worker.watts);
     for (const name of TEMPERATURES) {
-      text(fields[name], fmt(worker[name], "°C"));
+      showTemperature(fields[name], worker[name]);
       fields[name].dataset.tone = thermalTone(worker[name], state.status?.limits?.[`${name}_limit`]);
     }
     text(fields.shares, `Шары: ${n(worker.accepted, 0)} принято · ${n(worker.rejected, 0)} отклонено`);
@@ -198,9 +223,11 @@ function renderStatus() {
   const active = workers.filter(isRunning);
   const devices = workers.filter(worker => worker.device);
   text($("live-workers"), `${active.length} / ${workers.length}`);
-  text($("live-rate"), rate(!active.length && workers.length
-    && workers.every(worker => !["starting", "stopping", "unavailable"].includes(worker.state)) ? 0 : sum(active, "rate_hs")));
-  text($("live-watts"), fmt(sum(devices, "watts"), "Вт"));
+  const liveRate = !active.length && workers.length
+    && workers.every(worker => !["starting", "stopping", "unavailable"].includes(worker.state)) ? 0 : sum(active, "rate_hs");
+  const livePower = sum(devices, "watts");
+  showLiveReading($("live-rate"), rate(liveRate), liveRate);
+  showLiveReading($("live-watts"), fmt(livePower, "Вт"), livePower);
   text($("live-shares"), `${n(sum(active, "accepted"), 0)} / ${n(sum(active, "rejected"), 0)}`);
   $("first-run").hidden = Boolean(workers.length && profile?.wallet);
   text($("step-profile-title"), profile?.wallet ? "Профиль пула сохранён" : "Задайте профиль пула");
@@ -209,21 +236,20 @@ function renderStatus() {
   all("[data-profile]").forEach(button => button.classList.toggle("primary", !profile?.wallet));
   $("first-run").querySelector("[data-discovery]").classList.toggle("primary", Boolean(profile?.wallet && !workers.length));
   const supportPercent = fmt(support?.basis_points / 100, "%", 2);
-  const liveFee = state.online && support?.state === "online";
-  const feeLabel = liveFee ? "DevFee online" : state.online ? "DevFee · нужна проверка" : "DevFee · нет связи";
+  const [feeState, feeTone, feeDetails] = !state.online ? DEVFEE.offline : DEVFEE[support?.state] || DEVFEE.unavailable;
+  const feeLabel = `DevFee · ${feeState.toLocaleLowerCase("ru")}`;
   $("devfee").hidden = !support?.enabled;
-  $("devfee").dataset.tone = liveFee ? "good" : "warn";
+  $("devfee").dataset.tone = feeTone;
   text($("devfee-label"), feeLabel);
-  const runtimeShare = `${supportPercent} активного времени майнинга выделяется автору. С выплат ничего не списывается.`;
+  const runtimeShare = `${supportPercent} активного времени майнинга.`;
   text($("setup-support"), support?.enabled ? `${feeLabel}. ${runtimeShare}` : "");
   $("setup-support").hidden = !support?.enabled;
   $("support").hidden = !support?.enabled || !$("first-run").hidden;
   text($("support-summary"), runtimeShare);
-  text($("support-recipient"), support?.enabled && support.wallet ? `Получатель: ${support.wallet}` : "");
   const onSupport = inList(support?.active_workers);
-  text($("support-active"), !state.online ? "Нет свежих данных о воркерах."
-    : onSupport.length ? `Окно DevFee: ${onSupport.map(id => workers.find(worker => worker.id === id)?.label || id).join(", ")}.`
-    : liveFee ? "Сейчас нет активного окна DevFee." : "Проверьте журнал событий и место на диске.");
+  text($("support-active"), state.online && onSupport.length
+    ? `Окно DevFee: ${onSupport.map(id => workers.find(worker => worker.id === id)?.label || id).join(", ")}.`
+    : feeDetails);
   const alerts = workers.filter(worker => ["protection", "failed", "blocked", "unavailable"].includes(worker.state));
   const nearby = devices
     .flatMap(worker => TEMPERATURES.map(key => ({worker, key, tone: thermalTone(worker[key], limits?.[`${key}_limit`])})))
@@ -234,20 +260,9 @@ function renderStatus() {
     text($("attention-detail"), `${first.label || first.id}: ${safeLine(first.message) || STATES.get(first.state)[0]}${alerts.length > 1 ? ` · ещё ${alerts.length - 1}` : ""}`);
   } else if (nearby.length) {
     const {worker, key, tone} = nearby.find(entry => entry.tone === "bad") || nearby[0];
-    text($("attention-detail"), `${worker.label || worker.id}: ${METRICS[key][0]} ${fmt(worker[key], "°C")} · ${tone === "bad" ? "достигнут предел" : "приближение к пределу"}`);
+    text($("attention-detail"), `${worker.label || worker.id}: ${METRICS[key][0]} ${temperature(worker[key])} · ${tone === "bad" ? "достигнут предел" : "приближение к пределу"}`);
   }
-  const sensors = TEMPERATURES.map(key => {
-    const values = workers.map(row => row[key]).filter(Number.isFinite);
-    const value = values.length ? Math.max(...values) : null;
-    const limit = limits?.[`${key}_limit`];
-    const div = create("div");
-    const dd = create("dd", fmt(value, "°C"));
-    dd.dataset.tone = thermalTone(value, limit);
-    div.append(create("dt", METRICS[key][0]), dd, create("small",
-      `Датчики: ${values.length} / ${workers.length} · предел: ${Number.isFinite(limit) ? fmt(limit, "°C") : "не задан"}`));
-    return div;
-  });
-  $("live-thermal").replaceChildren(...sensors);
+  renderThermalSensors(devices, limits);
   text($("worker-summary"), workers.length ? `В работе: ${active.length} из ${workers.length}` : "Нет настроенных воркеров.");
   $("workers-empty").hidden = Boolean(workers.length);
   workerCards(workers);
@@ -256,15 +271,40 @@ function renderStatus() {
   for (const button of all("[data-limits], [data-profile], [data-wallets], [data-discovery], [data-totp]")) button.disabled = !state.online;
 }
 
+function renderThermalSensors(devices, limits) {
+  const sensors = $("live-thermal");
+  if (!sensors.childElementCount) {
+    for (const key of TEMPERATURES) {
+      const row = create("div");
+      row.append(create("dt", METRICS[key][0]), create("dd"), create("small"));
+      sensors.append(row);
+    }
+  }
+  for (const [index, key] of TEMPERATURES.entries()) {
+    const row = sensors.children[index];
+    const values = devices.map(device => device[key]).filter(Number.isFinite);
+    const reading = values.length ? Math.max(...values) : null;
+    const limit = limits?.[`${key}_limit`];
+    const metric = row.querySelector("dd");
+    showTemperature(metric, reading);
+    metric.dataset.tone = thermalTone(reading, limit);
+    text(row.querySelector("small"),
+      `Датчики: ${values.length} / ${devices.length} · предел ${Number.isFinite(limit) ? temperature(limit) : "не задан"}`);
+  }
+}
+
 function renderEvents() {
-  const raw = inList(state.events);
   const filter = $("event-filter").value;
-  const entries = raw.filter(event => !filter || event.type === filter)
-    .sort((a, b) => (b.time || 0) - (a.time || 0)).slice(0, 300);
+  const loaded = state.eventsKind === filter && state.events !== null;
+  const entries = loaded ? inList(state.events).slice().sort((a, b) => b.time - a.time) : [];
   const key = JSON.stringify([filter, entries]);
   if (state.eventsKey !== key) {
-    $("event-list").replaceChildren(...entries.map(event => {
+    const list = $("event-list");
+    const focused = list.contains(document.activeElement) ? document.activeElement.id : "";
+    list.replaceChildren(...entries.map(event => {
       const row = create("li");
+      row.id = `event-${event.id}`;
+      row.tabIndex = -1;
       const time = create("time", eventTime(event.time), "event-time");
       if (Number.isFinite(event.time)) time.dateTime = new Date(event.time * 1000).toISOString();
       const type = create("span", EVENTS.get(event.type) || "Событие", "event-kind");
@@ -276,11 +316,130 @@ function renderEvents() {
       row.append(time, type, body);
       return row;
     }));
+    if (focused && state.focusEvent === null) $(focused)?.focus({preventScroll: true});
     state.eventsKey = key;
   }
+  if (loaded && state.focusEvent !== null) {
+    $(`event-${state.focusEvent}`)?.focus();
+    state.focusEvent = null;
+  }
   $("events-empty").hidden = entries.length > 0 && !state.eventsError;
-  text($("events-empty"), state.eventsError || (!state.events ? "Загружаем события…" :
+  text($("events-empty"), state.eventsError || (!loaded ? "Загружаем события…" :
     filter ? "Нет событий этого типа." : "Событий пока нет."));
+}
+
+function openWorkerLog(id) {
+  const worker = inList(state.status?.workers).find(row => row.id === id);
+  if (!worker) return;
+  Object.assign(workerLog, {id, request: null, key: ""});
+  text($("worker-log-name"), worker.label || worker.id);
+  text($("worker-log-message"), "Загружаем журнал…");
+  $("worker-log-entries").hidden = true;
+  $("worker-log-entries").replaceChildren();
+  $("worker-log-dialog").showModal();
+  refreshWorkerLog();
+}
+
+async function refreshWorkerLog() {
+  const dialog = $("worker-log-dialog");
+  if (state.mode !== "app" || state.authMutation || !dialog.open || !workerLog.id || workerLog.request) return;
+  const {id} = workerLog;
+  const authEpoch = state.authEpoch;
+  const request = workerLog.request = {};
+  const current = () => dialog.open && request === workerLog.request && authEpoch === state.authEpoch;
+  try {
+    const response = await api(`logs?worker=${encodeURIComponent(id)}`);
+    if (!current()) return;
+    const entries = inList(response.entries);
+    const list = $("worker-log-entries");
+    const key = JSON.stringify(entries);
+    if (key !== workerLog.key) {
+      const scroll = list.scrollTop;
+      list.replaceChildren(...entries.map(workerLogEntry));
+      list.scrollTop = scroll;
+      workerLog.key = key;
+    }
+    list.hidden = !entries.length;
+    text($("worker-log-message"), entries.length ? "Последние записи с запуска панели. Обновляются автоматически."
+      : "Записей пока нет. События и доступная телеметрия появятся после запуска воркера.");
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401) { showLogin(true); return; }
+    text($("worker-log-message"), $("worker-log-entries").hidden ? "Журнал временно недоступен."
+      : "Журнал не обновился. Показаны последние полученные записи.");
+  } finally {
+    if (workerLog.request === request) workerLog.request = null;
+  }
+}
+
+function workerLogEntry(entry) {
+  const row = create("li");
+  const time = create("time", eventTime(entry.time), "event-time");
+  if (Number.isFinite(entry.time)) time.dateTime = new Date(entry.time * 1000).toISOString();
+  row.append(time);
+  if (entry.type === "telemetry") {
+    row.append(create("strong", "Телеметрия", "log-metric"));
+    const readings = create("span", undefined, "log-readings");
+    if (Number.isFinite(entry.rate_hs)) readings.append(create("span", rate(entry.rate_hs)));
+    if (Number.isFinite(entry.accepted)) readings.append(create("span", `Принято ${n(entry.accepted, 0)}`, "log-good"));
+    if (Number.isFinite(entry.rejected)) readings.append(create("span", `Отклонено ${n(entry.rejected, 0)}`,
+      entry.rejected > 0 ? "log-warn" : ""));
+    row.append(readings);
+  } else {
+    const tone = entry.type === "thermal" || ["failed", "unconfirmed"].includes(entry.status) ? "log-warn"
+      : entry.type === "start" ? "log-good" : "";
+    row.append(create("strong", EVENTS.get(entry.type) || "Событие", tone),
+      create("span", safeLine(entry.detail) || "—"));
+  }
+  return row;
+}
+
+function renderNetwork() {
+  const snapshot = network.data;
+  const data = snapshot?.data;
+  $("network-stats").hidden = !data;
+  const hs = data?.hashrate_hs;
+  text($("network-height"), n(data?.height, 0));
+  text($("network-hashrate"), hs >= 1e12 ? fmt(hs / 1e12, "ТХ/с", 3)
+    : hs >= 1e9 ? fmt(hs / 1e9, "ГХ/с", 3) : rate(hs));
+  text($("network-reward"), fmt(data?.reward_neb, "NEB", 4));
+  const estimate = !network.error && snapshot?.state === "fresh" ? snapshot.estimate_neb_day : null;
+  text($("network-estimate"), fmt(estimate, "NEB", 4));
+  const last = data ? `Suprnova · ${eventTime(data.observed_at)}.` : "";
+  let detail = "Данные Suprnova загружаются по запросу.";
+  if (network.error || snapshot?.state === "unavailable") detail = "Данные сети недоступны.";
+  else if (snapshot?.state === "loading") detail = "Обновляем данные сети…";
+  else if (snapshot?.state === "stale") detail = "Данные сети устарели.";
+  else if (snapshot?.state === "fresh") detail = Number.isFinite(estimate)
+    ? `Валовая оценка до комиссий при среднем хешрейте ${rate(snapshot.local_rate_hs)} за последние 30 минут.`
+    : "Для оценки нужно больше свежих замеров локального хешрейта за последние 30 минут.";
+  text($("network-message"), [last, detail].filter(Boolean).join(" "));
+  $("network-check").disabled = Boolean(network.request) || snapshot?.state === "loading";
+}
+
+async function loadNetwork(refresh = false) {
+  if (state.view !== "overview" || state.mode !== "app" || state.authMutation || network.request) return;
+  const request = network.request = {};
+  const authEpoch = state.authEpoch;
+  const current = () => request === network.request && authEpoch === state.authEpoch;
+  if (refresh) text($("network-message"), "Обновляем данные сети…");
+  $("network-check").disabled = true;
+  try {
+    const data = refresh ? await api("network/refresh", {}) : await api("network");
+    if (!current()) return;
+    network.data = data;
+    network.error = "";
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401) { showLogin(true); return; }
+    network.error = "offline";
+  } finally {
+    if (request === network.request) {
+      const active = current();
+      network.request = null;
+      if (active) renderNetwork();
+    }
+  }
 }
 
 function svg(tag, attrs, content) {
@@ -294,125 +453,77 @@ function drawHistory() {
   if (state.view !== "overview") return;
   const width = $("chart-wrap").clientWidth;
   if (!width) return;
-  const h = state.history;
-  const current = $("period").value;
-  const data = h?.range === current ? h : null;
+  const period = $("period").value;
+  const data = state.history?.range === period ? state.history : null;
   const metric = $("metric").value;
   const [label, unit] = METRICS[metric];
-  const limit = TEMPERATURES.includes(metric) ? state.status?.limits?.[`${metric}_limit`] : null;
   const status = state.historyError || (data ? "" : "Загружаем историю…");
-  const key = JSON.stringify([width, metric, data, status, limit]);
+  const key = JSON.stringify([width, metric, data, status]);
   if (state.chartKey === key) return;
   state.chartKey = key;
+
   const chart = $("chart-svg");
-  chart.setAttribute("viewBox", `0 0 ${width} 230`);
-  chart.setAttribute("aria-label", `${label}: ${$("period").selectedOptions[0].textContent}`);
-  chart.replaceChildren();
-  text($("history-count"), data && Number.isFinite(data.count) ? `Замеров: ${n(data.count, 0)}` : "");
+  chart.setAttribute("aria-label", label + " · " + $("period").selectedOptions[0].textContent);
+  text($("history-count"), Number.isFinite(data?.count) ? `Замеров: ${n(data.count, 0)}` : "");
   const help = status && data ? `${status} Показаны последние полученные данные.`
-    : "Пропуск означает, что данных не было. Время показано по часам браузера.";
-  text($("chart-caption"), `${help}${Number.isFinite(limit) ? ` Пунктир: текущий предел ${fmt(limit, "°C")}.` : ""}`);
+    : "Разрывы линии показывают пропуски измерений. Стрелки на клавиатуре перемещают указатель.";
+  text($("chart-caption"), help);
   $("chart-empty").hidden = false;
   text($("chart-empty"), status || "Нет значений за этот период.");
   if (!data || !Number.isFinite(data.from) || !Number.isFinite(data.to) || data.to <= data.from) {
-    renderIncidentButtons([]);
+    clearHistoryPlot(chart);
+    renderChartEvents([]);
     return;
   }
-  const left = width < 340 ? 46 : 52;
-  const right = width - 15, top = 25, bottom = 195;
-  const x = stamp => left + (stamp - data.from) / (data.to - data.from) * (right - left);
-  const rows = inList(data.series).filter(row => Number.isFinite(row.t) && row.t >= data.from && row.t <= data.to)
-    .slice(0, 1500).sort((a, b) => a.t - b.t);
-  const values = rows.map(row => row[metric]).filter(Number.isFinite);
-  const thermal = TEMPERATURES.includes(metric);
-  const scale = Number.isFinite(limit) ? [...values, limit] : values;
-  const maximum = scale.length ? Math.max(...scale) : 0;
-  const minimum = scale.length ? Math.min(...scale) : 0;
-  const lo = thermal ? Math.floor((minimum - 5) / 5) * 5 : 0;
-  const hi = thermal ? Math.max(lo + 10, Math.ceil((maximum + 5) / 5) * 5) : maximum > 0 ? maximum * 1.08 : 1;
-  const y = value => bottom - (value - lo) / (hi - lo) * (bottom - top);
-  for (let i = 0; i <= 4; i++) {
-    const value = lo + (hi - lo) * i / 4;
-    chart.append(svg("line", {x1: left, x2: right, y1: y(value), y2: y(value), class: "chart-grid"}));
-    if (scale.length) chart.append(svg("text", {x: left - 7, y: y(value) + 3, "text-anchor": "end", class: "chart-text"},
-      n(value, metric === "efficiency" ? 4 : metric === "rate" ? 3 : 1)));
-  }
-  if (unit && scale.length) chart.append(svg("text", {x: left, y: 15, class: "chart-text"}, unit));
-  const interval = right - left;
-  const ticks = width < 510 ? 2 : 4;
-  for (let i = 0; i <= ticks; i++) {
-    const stamp = data.from + (data.to - data.from) * i / ticks;
-    const at = left + interval * i / ticks;
-    const tick = current === "7d" || current === "30d"
-      ? localTime(stamp, {day: "2-digit", month: "2-digit"}) : clock(stamp);
-    chart.append(svg("line", {x1: at, x2: at, y1: top, y2: bottom, class: "chart-grid"}),
-      svg("text", {x: at, y: 216, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle", class: "chart-text"}, tick));
-  }
-  if (Number.isFinite(limit)) chart.append(svg("line", {x1: left, x2: right, y1: y(limit), y2: y(limit), class: "chart-limit"}));
-  const incidents = inList(data.incidents).filter(event => event.type === "thermal" && Number.isFinite(event.time)
+
+  const thresholds = TEMPERATURES.includes(metric) ? inList(data.thresholds) : [];
+  const segments = thresholds.flatMap((row, i) => {
+    const start = Math.max(row.t, data.from);
+    const end = thresholds[i + 1]?.t ?? data.to;
+    const limit = row[`${metric}_limit`];
+    return Number.isFinite(limit) && start < end ? [{start, end, limit}] : [];
+  });
+  if (segments.length) text($("chart-caption"), `${help} Пунктир показывает действовавшие пороги.`);
+  const markers = inList(data.markers ?? data.incidents).filter(event => Number.isFinite(event.time)
     && event.time >= data.from && event.time <= data.to).sort((a, b) => a.time - b.time).slice(-150);
-  for (const event of incidents) {
-    const at = x(event.time);
-    const marker = svg("g", {"data-incident": ""});
-    marker.append(svg("title", {}, `${eventTime(event.time)} · ${event.worker || "Термозащита"} · ${safeLine(event.detail)}`),
-      svg("line", {x1: at, x2: at, y1: top, y2: bottom, class: "chart-marker"}),
-      svg("path", {d: `M${at},${top + 6} l-4,-6 h8 z`, class: "chart-alert"}));
-    chart.append(marker);
-  }
-  renderIncidentButtons(incidents);
-  if (!values.length) return;
-  $("chart-empty").hidden = true;
-  const layer = svg("g", {"data-series": ""});
-  let line = [];
-  let previous = null;
-  function flush() {
-    if (line.length > 1) layer.append(svg("path", {d: `M${line.join(" L")}`, class: "chart-line", "data-kind": thermal ? "thermal" : metric}));
-    line = [];
-  }
-  for (const row of rows) {
-    const value = row[metric];
-    if (!Number.isFinite(value)) {
-      flush();
-      previous = null;
-      continue;
-    }
-    if (previous !== null && Number.isFinite(data.step) && row.t - previous > data.step * 1.1) flush();
-    const px = x(row.t), py = y(value);
-    line.push(`${px},${py}`);
-    const point = svg("circle", {cx: px, cy: py, r: values.length > 180 ? 1.25 : 2.2,
-      class: "chart-point", "data-kind": thermal ? "thermal" : metric, "data-point": ""});
-    point.append(svg("title", {}, `${eventTime(row.t)} · ${n(value, 3)} ${unit}`));
-    layer.append(point);
-    previous = row.t;
-  }
-  flush();
-  chart.append(layer);
+  const hasValues = renderHistoryPlot({
+    chart, width, data, metric, label, unit, segments, markers,
+    formatNumber: n, formatTime: eventTime,
+    formatTick: stamp => period.endsWith("d") ? localTime(stamp, {day: "2-digit", month: "2-digit"}) : clock(stamp),
+    onEvent: openChartEvent,
+  });
+  renderChartEvents(markers);
+  $("chart-empty").hidden = hasValues || Boolean(markers.length);
 }
 
-function renderIncidentButtons(incidents) {
-  const latest = incidents.slice(-4).reverse();
-  const key = JSON.stringify([latest, incidents.length > 4]);
+function renderChartEvents(markers) {
+  const latest = markers.slice(-4).reverse();
+  const key = JSON.stringify([latest, markers.length > 4]);
   if (state.incidentsKey === key) return;
   state.incidentsKey = key;
   $("chart-incidents").hidden = !latest.length;
   const buttons = latest.map(event => {
-    const button = create("button", `${eventTime(event.time)} · ${event.worker || "Термозащита"}`, "incident-link");
+    const action = event.type === "exit" ? "Аварийное завершение" : EVENTS.get(event.type) || "Событие";
+    const button = create("button", `${eventTime(event.time)} · ${action}`, "incident-link");
     button.type = "button";
-    button.title = safeLine(event.detail);
-    button.addEventListener("click", openThermalEvents);
+    button.dataset.type = event.type;
+    button.title = [event.worker, safeLine(event.detail)].filter(Boolean).join(" · ");
+    button.addEventListener("click", () => openChartEvent(event));
     return button;
   });
-  if (incidents.length > 4) {
-    const button = create("button", "Все события защиты", "incident-link");
+  if (markers.length > 4) {
+    const button = create("button", "Журнал событий", "incident-link");
     button.type = "button";
-    button.addEventListener("click", openThermalEvents);
+    button.addEventListener("click", () => openChartEvent());
     buttons.push(button);
   }
   $("incident-list").replaceChildren(...buttons);
 }
 
-function openThermalEvents() {
-  $("event-filter").value = "thermal";
+function openChartEvent(event = null) {
+  $("event-filter").value = event?.type || "";
+  state.focusEvent = event?.id ?? null;
+  state.eventsError = "";
   setView("events", true);
 }
 
@@ -423,25 +534,29 @@ async function refreshTimeline() {
   const authEpoch = state.authEpoch;
   const view = state.view;
   const period = $("period").value;
+  const kind = $("event-filter").value;
   const current = () => generation === state.generation && authEpoch === state.authEpoch && state.mode === "app" && seq === state.timelineSeq
-    && view === state.view && (view !== "overview" || period === $("period").value);
+    && view === state.view && (view === "overview" ? period === $("period").value : kind === $("event-filter").value);
   try {
     if (view === "overview") {
+      loadNetwork();
       const data = await api(`history?range=${encodeURIComponent(period)}`);
       if (!current()) return;
       state.history = data;
       state.historyError = "";
     } else {
-      const data = await api("events");
+      const data = await api(kind ? `events?kind=${encodeURIComponent(kind)}` : "events");
       if (!current()) return;
       state.events = data.events;
+      state.eventsKind = kind;
       state.eventsError = "";
     }
   } catch (error) {
     if (!current()) return;
     if (error.status === 401) { if (!state.authMutation) showLogin(true); return; }
     if (view === "overview") state.historyError = "История временно недоступна.";
-    else state.eventsError = state.events ? "Журнал недоступен. Показаны последние полученные данные." : "Журнал временно недоступен.";
+    else state.eventsError = state.events && state.eventsKind === kind
+      ? "Журнал недоступен. Показаны последние полученные данные." : "Журнал временно недоступен.";
   }
   if (view === "overview") drawHistory();
   else renderEvents();
@@ -652,6 +767,7 @@ function clearTotp() {
   $("totp-qr").replaceChildren();
   $("totp-qr-wrap").hidden = true;
   $("totp-codes").replaceChildren();
+  $("totp-recovery-download").hidden = true;
   text($("totp-secret"), "");
   text($("totp-message"), "");
   renderTotpStep("");
@@ -759,6 +875,7 @@ async function confirmTotp(event) {
     const codes = inList(data.recovery_codes).filter(code => typeof code === "string" && code.length <= 80).slice(0, 20);
     $("totp-codes").replaceChildren(...codes.map(code => create("li", code)));
     $("totp-recovery-copy").hidden = !codes.length;
+    $("totp-recovery-download").hidden = !codes.length;
     renderTotpStep("recovery");
     text($("totp-status"), "Двухфакторная защита включена.");
     text($("totp-message"), codes.length ? "" : "Сервер не вернул список резервных кодов.");
@@ -774,7 +891,7 @@ async function confirmTotp(event) {
       totp.busy = state.authMutation = false;
       setAuxBusy("totp-dialog", false);
       if (!$("totp-recovery").hidden) {
-        ($("totp-recovery-copy").hidden ? $("totp-dialog").querySelector("[data-close]") : $("totp-recovery-copy")).focus();
+        ($("totp-recovery-download").hidden ? $("totp-dialog").querySelector("[data-close]") : $("totp-recovery-download")).focus();
         await refreshStatus({fresh: true});
       } else if (totp.expiresAt && Date.now() >= totp.expiresAt) {
         totpInitial();
@@ -1008,7 +1125,7 @@ function renderDiscovery() {
     });
     if (allowed) available.add(dev);
     label.append(check, create("span", `${vendorTitle} · ${dev}`, "mono"));
-    row.append(label, create("p", reason || `Ядро ${fmt(device.edge, "°C")} · hotspot ${fmt(device.hot, "°C")}`, "subline"));
+    row.append(label, create("p", reason || `Ядро ${temperature(device.edge)} · hotspot ${temperature(device.hot)}`, "subline"));
     return row;
   });
   for (const id of setup.selected) if (!available.has(id)) setup.selected.delete(id);
@@ -1496,6 +1613,9 @@ $("totp-recovery-copy").addEventListener("click", () => {
   const codes = [...$("totp-codes").children].map(row => row.textContent).join("\n");
   if (codes) copySensitive(codes, $("totp-message"), () => seq === totp.seq);
 });
+$("totp-recovery-download").addEventListener("click", () => {
+  if ($("totp-dialog").open && !$("totp-recovery").hidden) downloadRecoveryCodes($("totp-codes"));
+});
 
 $("wallets-dialog").addEventListener("close", () => {
   if ($("wallets-dialog").open) return;
@@ -1610,7 +1730,19 @@ $("period").addEventListener("change", () => {
   refreshTimeline();
 });
 $("metric").addEventListener("change", drawHistory);
-$("event-filter").addEventListener("change", renderEvents);
+$("event-filter").addEventListener("change", () => {
+  state.focusEvent = null;
+  state.eventsError = "";
+  renderEvents();
+  refreshTimeline();
+});
+$("network-check").addEventListener("click", () => loadNetwork(true));
+$("worker-log-dialog").addEventListener("close", () => {
+  if (!$("worker-log-dialog").open) {
+    Object.assign(workerLog, {id: null, request: null, key: ""});
+    $("worker-log-entries").replaceChildren();
+  }
+});
 $("retry").addEventListener("click", refreshStatus);
 if ("ResizeObserver" in window) new ResizeObserver(drawHistory).observe($("chart-wrap"));
 else window.addEventListener("resize", drawHistory);
@@ -1622,6 +1754,7 @@ function wake() {
   refreshStatus();
   refreshTimeline();
   loadFleet();
+  refreshWorkerLog();
 }
 document.addEventListener("visibilitychange", wake);
 window.addEventListener("focus", wake);
@@ -1640,6 +1773,7 @@ window.addEventListener("offline", () => {
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 4000);
 setInterval(() => { if (!document.hidden) refreshTimeline(); }, 14000);
 setInterval(() => { if (!document.hidden) loadFleet(); }, 5000);
+setInterval(() => { if (!document.hidden) refreshWorkerLog(); }, 3000);
 setInterval(() => {
   if (!document.hidden && $("discovery-dialog").open && inList(setup.data?.miners).some(miner => miner.state === "downloading")) loadDiscovery();
 }, 3000);

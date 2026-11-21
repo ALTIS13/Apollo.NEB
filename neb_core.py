@@ -16,6 +16,7 @@ from urllib.parse import urlencode, urlsplit
 
 B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 SESSION_SECONDS = 12 * 3600
+DEVFEE_BASIS_POINTS = 110
 LIMITS = {"edge_limit": 80, "hot_limit": 100, "hbm_limit": None}
 POOL_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 DEFAULT_POOLS = [{"id": "suprnova-eu", "label": "Suprnova · EU · TLS",
@@ -113,8 +114,8 @@ def support_config(data):
     if not isinstance(data, dict) or data.get("enabled") is not True:
         raise ValueError("Сначала подтвердите участие явно.")
     bps = data.get("basis_points")
-    if type(bps) is not int or not 1 <= bps <= 100:
-        raise ValueError("Поддержка автора может занимать не более 1% рабочего времени.")
+    if type(bps) is not int or not 1 <= bps <= DEVFEE_BASIS_POINTS:
+        raise ValueError("Недопустимая доля DevFee.")
     return {"enabled": True, "wallet": wallet(data.get("wallet")), "basis_points": bps}
 
 

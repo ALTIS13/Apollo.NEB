@@ -35,7 +35,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(core.support_config(None)["enabled"])
         for invalid in ({"wallet": SUPPORT, "basis_points": 50},
                         {"enabled": True, "wallet": "", "basis_points": 50},
-                        {"enabled": True, "wallet": SUPPORT, "basis_points": 101}):
+                        {"enabled": True, "wallet": SUPPORT, "basis_points": 111}):
             with self.assertRaises(ValueError):
                 core.support_config(invalid)
 

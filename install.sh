@@ -7,7 +7,7 @@ neb_cfg=
 neb_state=
 service=0
 run_now=0
-fee_notice='DevFee: 0.5% of active mining time uses the author’s NEB wallet; not a deduction from payouts.'
+fee_notice='DevFee: 1.1% of active mining time. You can see its status in the dashboard.'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help)
@@ -59,8 +59,8 @@ base="$neb_prefix/lib/apollo-neb"
 mkdir -p -- "$base" "$neb_prefix/bin"
 release=$(mktemp -d "$base/release.XXXXXXXX")
 install -d -m0700 "$release/web"
-modules='neb.py neb_core.py neb_app.py neb_history.py neb_runtime.py neb_setup.py neb_wallet.py neb_release.py neb_fleet.py developer-support.json'
-assets='index.html ui.js ui.css brand.svg qr.js'
+modules='neb.py neb_core.py neb_app.py neb_history.py neb_runtime.py neb_setup.py neb_wallet.py neb_release.py neb_fleet.py neb_devfee.py neb_devfee_owner.py neb_network.py developer-support.json'
+assets='index.html ui.js ui.css brand.svg qr.js devfee.html devfee.js view.html view.js live-metrics.js recovery-codes.js history-chart.js'
 for f in $modules; do install -m0600 "$src/$f" "$release/$f"; done
 for f in $assets; do install -m0600 "$src/web/$f" "$release/web/$f"; done
 printf '%s\n' '02 / Preparing the administrator account'

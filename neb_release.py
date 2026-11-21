@@ -14,7 +14,8 @@ from urllib.request import Request, urlopen
 
 from neb_setup import Asset, download, file_digest
 
-VERSION = "0.7.1-rc.1"
+VERSION = "0.8.0-rc.1"
+MINIMUM_RELEASE = "0.7.1-rc.1"
 REPO = "ALTIS13/Apollo.NEB"
 RELEASES = f"https://github.com/{REPO}/releases"
 REMOTE = f"repos/{REPO}/releases?per_page=20"
@@ -36,7 +37,7 @@ def select(records):
             continue
         tag = release.get("tag_name")
         order = version(tag)
-        if order is None:
+        if order is None or order < version(MINIMUM_RELEASE):
             continue
         base = ".".join(str(n) for n in order[:3])
         name = f"apollo-neb-{base}-linux.tar.gz"

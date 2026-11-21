@@ -35,6 +35,8 @@ PLACEHOLDER = re.compile(r"\{(pool|wallet|worker|device|dataset)\}")
 ADAPTERS = {"custom", "suprminer-opencl", "suprminer-cuda"}
 WORKER_FIELDS = {"id", "label", "adapter", "binary", "dataset", "device", "device_index", "args", "log_format"}
 METRICS = ("edge", "hot", "hbm", "watts")
+JOURNAL_KEEP = 80
+JOURNAL_INTERVAL = 5
 
 
 def _clean(value, max_length):
@@ -511,12 +513,20 @@ def _spawn_guard(argv, cwd, env, capture, deadline):
                     pass  # The still-owned group has received SIGKILL; no restart was accepted.
 
 
+class _Journal:
+    def __init__(self):
+        self.rows = deque(maxlen=JOURNAL_KEEP)
+        self.lock = threading.RLock()
+        self.active_child = None
+
+
 @dataclass
 class _Child:
     proc: subprocess.Popen
     log_format: str
     card: dict | None
     status_fd: int
+    journal: _Journal
     end_read: threading.Event = field(default_factory=threading.Event)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     stats: dict = field(default_factory=dict)
@@ -524,11 +534,24 @@ class _Child:
 
     def observe(self):
         stream = self.proc.stdout
+        pending = {}
+        next_sample = -math.inf
+
+        def flush(now):
+            nonlocal next_sample
+            with self.journal.lock:
+                if self.journal.active_child is self:
+                    self.journal.rows.append(dict(type="telemetry", time=int(time.time()), **pending))
+            pending.clear()
+            next_sample = now + JOURNAL_INTERVAL
+
         try:
             with selectors.DefaultSelector() as selector, stream:
                 selector.register(stream, selectors.EVENT_READ)
                 record, overflow = bytearray(), False
                 while not self.end_read.is_set():
+                    if pending and (now := time.monotonic()) >= next_sample:
+                        flush(now)
                     if not selector.select(0.2):
                         continue
                     chunk = os.read(stream.fileno(), 4096)
@@ -542,12 +565,19 @@ class _Child:
                         if part.endswith(b"\n"):
                             if not overflow:
                                 values = _metrics(record, self.log_format)
-                                now = time.monotonic()
-                                with self.stats_lock:
-                                    self.stats.update({k: (v, now) for k, v in values.items()})
+                                if values:
+                                    now = time.monotonic()
+                                    with self.stats_lock:
+                                        self.stats.update({key: (value, now) for key, value in values.items()})
+                                    pending.update(values)
+                                    if now >= next_sample:
+                                        flush(now)
                             record, overflow = bytearray(), False
         except OSError:
             pass
+        finally:
+            if pending:
+                flush(time.monotonic())
 
     def finished(self):
         # Observe without reaping. The still-owned leader's PID prevents group-ID reuse
@@ -588,12 +618,20 @@ class Manager:
         self._live = {}
         self._expired = set()
         self._events = deque(maxlen=1024)
+        self._journals = {ident: _Journal() for ident in self._workers}
         self._lock = threading.RLock()
         self._limits = _limits({})
         self._closed = False
 
     def _event(self, kind, ident, detail, status):
-        self._events.append(dict(type=kind, time=int(time.time()), worker=ident, detail=detail, status=status))
+        journal = self._journals[ident]
+        with journal.lock:
+            if kind != "start":
+                # A detached reader can still return buffered bytes after a thermal stop.
+                journal.active_child = None
+            row = dict(type=kind, time=int(time.time()), detail=detail, status=status)
+            journal.rows.append(row)
+        self._events.append(dict(worker=ident, **row))
 
     def _worker(self, ident):
         if not isinstance(ident, str) or ident not in self._workers:
@@ -612,6 +650,7 @@ class Manager:
                 if ident not in self._workers:
                     self._workers[ident] = item
                     self._state[ident] = ("stopped", "Stopped.")
+                    self._journals[ident] = _Journal()
 
     def _exit_if_finished(self, ident):
         child = self._live.get(ident)
@@ -668,19 +707,23 @@ class Manager:
             except OSError:
                 self._state[worker_id] = ("failed", "Configured miner could not start.")
                 raise RuntimeError("Configured miner could not start.") from None
-            child = _Child(proc, worker["log_format"], card, status_fd)
+            journal = self._journals[worker_id]
+            child = _Child(proc, worker["log_format"], card, status_fd, journal)
             self._live[worker_id] = child
-            if proc.stdout:
-                child.thread = threading.Thread(target=child.observe, daemon=True)
-                try:
-                    child.thread.start()
-                except RuntimeError:
-                    child.thread = None
-                    self._stop(worker_id, "stop", "Miner output reader could not start.", "failed")
-                    proc.stdout.close()
-                    raise RuntimeError("Miner output reader could not start.") from None
-            self._state[worker_id] = ("running", "Miner process started.")
-            self._event("start", worker_id, "Miner process started.", "running")
+            # Record start before its reader can append any samples.
+            with journal.lock:
+                if proc.stdout:
+                    journal.active_child = child
+                    child.thread = threading.Thread(target=child.observe, daemon=True)
+                    try:
+                        child.thread.start()
+                    except RuntimeError:
+                        child.thread = None
+                        self._stop(worker_id, "stop", "Miner output reader could not start.", "failed")
+                        proc.stdout.close()
+                        raise RuntimeError("Miner output reader could not start.") from None
+                self._state[worker_id] = ("running", "Miner process started.")
+                self._event("start", worker_id, "Miner process started.", "running")
 
     def _stop(self, ident, kind, detail, status):
         child = self._live.get(ident)
@@ -749,6 +792,13 @@ class Manager:
                                    exit_reason="time-limit" if ident in self._expired else None,
                                    **{metric: (card or {}).get(metric) for metric in METRICS}, **stats))
             return result
+
+    def journal(self, worker_id) -> list[dict]:
+        with self._lock:
+            self._worker(worker_id)
+            journal = self._journals[worker_id]
+        with journal.lock:
+            return [row.copy() for row in reversed(journal.rows)]
 
     def drain_events(self) -> list[dict]:
         with self._lock:

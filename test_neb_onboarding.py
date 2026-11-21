@@ -109,6 +109,16 @@ class OnboardingTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_catalog_excludes_versions_before_first_mandatory_devfee(self):
+        def record(tag, base):
+            asset = {"name": f"apollo-neb-{base}-linux.tar.gz", "size": 900, "digest": "sha256:" + "a" * 64}
+            return {"draft": False, "tag_name": tag, "assets": [asset]}
+
+        retired = [record("v0.6.0-rc.1", "0.6.0"), record("v0.7.0-rc.1", "0.7.0")]
+        self.assertIsNone(neb_release.select(retired))
+        current = record("v0.7.1-rc.1", "0.7.1")
+        self.assertEqual(neb_release.select([*retired, current])[1], "v0.7.1-rc.1")
+
     def test_staging_reads_legacy_auth_without_migrating_it(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"auth.sqlite"
