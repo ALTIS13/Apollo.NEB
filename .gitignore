@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env*
+local/
+dist/
+*.sqlite*
+login.json
+profile.json
+workers.json
+pools.json
+settings.json
+support-time.json
+*.pem
+*.key
+*.log

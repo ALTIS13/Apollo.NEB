@@ -1,0 +1,10 @@
+[
+  {
+    "id": "amd-1",
+    "label": "AMD · настройте PCI",
+    "adapter": "suprminer-opencl",
+    "binary": "/absolute/path/suprminer-opencl",
+    "dataset": "/absolute/path/neb-datasets.bin",
+    "device": "0000:01:00.0"
+  }
+]

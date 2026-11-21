@@ -1,0 +1,16 @@
+[Unit]
+Description=Apollo.NEB local mining dashboard
+After=network.target
+
+[Service]
+Type=exec
+ExecStart="%h/.local/bin/apollo-neb" serve
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=30
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Локальная панель майнинга NEB для Linux">
+  <title>Apollo.NEB — панель майнинга</title>
+  <link rel="stylesheet" href="/ui.css">
+  <script src="/ui.js" defer></script>
+</head>
+<body>
+  <a href="#main" class="skip">К содержимому</a>
+  <svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></symbol>
+    <symbol id="i-chip" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3"/></symbol>
+    <symbol id="i-journal" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6m-6 4h6m-6 4h4"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m10 3-.6 2.2-2 .9-2-.9-2.2 3.7 1.6 1.5v2.3l-1.6 1.5 2.2 3.7 2-.9 2 .9.6 2.1h4l.6-2.1 2-.9 2 .9 2.2-3.7-1.6-1.5v-2.3l1.6-1.5-2.2-3.7-2 .9-2-.9L14 3z"/></symbol>
+    <symbol id="i-temp" viewBox="0 0 24 24"><path d="M10 14.5V5a2 2 0 1 1 4 0v9.5a4 4 0 1 1-4 0Z"/><path d="M12 10v7m5-10h3m-3 4h2"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="m7 9 3 3-3 3m6 0h4"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 5v2"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 4.5a2 2 0 0 1 3.4 0l7.1 12.3a2 2 0 0 1-1.7 3H4.9a2 2 0 0 1-1.7-3l7.1-12.3Z"/><path d="M12 9v4m0 3v.2"/></symbol>
+  </svg>
+  <header class="top">
+    <div class="frame top-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 18V6l14 12V6M9 18v-5m6-2V6"/></svg></span><span>Apollo<span class="brand-suffix">.NEB</span></span></div>
+      <div class="top-tools">
+        <span class="connection" id="connection" data-tone="neutral"><i></i><span id="connection-label">Подключение…</span></span>
+        <button type="button" class="quiet" id="logout" hidden>Выйти</button>
+      </div>
+    </div>
+  </header>
+  <main id="main" class="frame" tabindex="-1">
+    <section id="boot" class="gate surface">
+      <h1>Подключение к панели</h1>
+      <p id="boot-message" role="status">Ожидаем ответ локальной службы…</p>
+      <button type="button" id="retry" hidden>Повторить</button>
+    </section>
+    <section id="login" class="gate surface" hidden>
+      <span class="tile-icon"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg></span>
+      <h1>Вход в Apollo.NEB</h1>
+      <p>Введите пароль администратора, заданный при установке на Linux.</p>
+      <form id="login-form">
+        <label>Пароль<input id="password" type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>
+        <label>Код из приложения <span class="subline">Только если включена двухфакторная защита</span><input id="login-code" name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label>
+        <button class="primary" type="submit">Войти</button>
+        <p id="login-message" class="form-message" role="status"></p>
+      </form>
+    </section>
+    <div id="app" hidden>
+      <div class="page-header">
+        <div>
+          <p class="eyebrow">КОНСОЛЬ МАЙНИНГА <span aria-hidden="true">/</span> LINUX</p>
+          <h1 id="page-title">Обзор фермы</h1>
+        </div>
+        <button type="button" id="profile-open" class="profile-button"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>Профиль пула</button>
+      </div>
+      <nav class="views" aria-label="Разделы панели">
+        <button type="button" data-view="overview" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#i-pulse"/></svg>Обзор</button>
+        <button type="button" data-view="workers"><svg class="icon" aria-hidden="true"><use href="#i-chip"/></svg>Воркеры</button>
+        <button type="button" data-view="events"><svg class="icon" aria-hidden="true"><use href="#i-journal"/></svg>События</button>
+      </nav>
+      <p id="notice" class="notice" role="status" hidden></p>
+      <section id="overview">
+        <section id="first-run" class="surface first-run" aria-labelledby="first-title" hidden>
+          <div class="first-body">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true"><use href="#i-terminal"/></svg></span>
+            <div>
+              <p class="eyebrow">НАСТРОЙКА</p>
+              <h2 id="first-title">Первый запуск</h2>
+              <p>Подключите профиль пула и добавьте устройства на Linux. Панель не запускает майнер автоматически.</p>
+            </div>
+          </div>
+          <ol class="steps">
+            <li><span class="step-number">01</span><div><h3 id="step-profile-title">Задайте профиль пула</h3><p>Нужен публичный адрес NEB для выплат. Приватный ключ или seed-фраза не нужны.</p></div><button type="button" class="primary" data-profile><span id="step-profile-action">Настроить профиль</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button></li>
+            <li><span class="step-number">02</span><div><h3 id="step-workers-title">Добавьте воркеры</h3><p>Выберите устройства и адаптеры в конфигурации Linux, затем запустите воркер на вкладке «Воркеры».</p></div><button type="button" data-setup>Настройка на Linux</button></li>
+          </ol>
+          <p id="setup-support" class="support-note"></p>
+        </section>
+        <section id="attention" class="attention" hidden aria-labelledby="attention-title">
+          <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+          <div><h2 id="attention-title">Требует внимания</h2><p id="attention-detail"></p></div>
+          <button type="button" data-go="workers">К воркерам<svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+        </section>
+        <dl class="summary surface" aria-label="Текущая сводка">
+          <div><dt>Воркеры в работе</dt><dd id="live-workers">—</dd></div>
+          <div><dt>Хешрейт</dt><dd id="live-rate">—</dd></div>
+          <div><dt>Потребление GPU</dt><dd id="live-watts">—</dd></div>
+          <div><dt>Принято / отклонено шар</dt><dd id="live-shares">—</dd></div>
+        </dl>
+        <div class="overview-grid">
+          <section class="surface history" aria-labelledby="history-title">
+            <div class="panel-head"><div><h2 id="history-title">История фермы</h2><p>Локальные измерения</p></div><span class="mono muted" id="history-count"></span></div>
+            <div class="chart-controls">
+              <label>Период <select id="period"><option value="30m">30 минут</option><option value="6h">6 часов</option><option value="24h">24 часа</option><option value="7d">7 дней</option><option value="30d">30 дней</option></select></label>
+              <label>Метрика <select id="metric"><option value="rate">Хешрейт</option><option value="watts">Потребление GPU</option><option value="edge">Ядро · средняя</option><option value="hot">Hotspot · максимум</option><option value="hbm">Память · средняя</option><option value="active">Активные воркеры</option><option value="efficiency">Эффективность GPU</option></select></label>
+            </div>
+            <div id="chart-wrap" class="chart-wrap">
+              <svg id="chart-svg" role="img" aria-label="История хешрейта"></svg>
+              <p id="chart-empty" class="chart-empty">Загружаем историю…</p>
+            </div>
+            <p class="chart-help" id="chart-caption">Пропуск означает, что данных не было.</p>
+            <div class="chart-incidents" id="chart-incidents" hidden><span class="event-key"><i></i>Термозащита</span><div id="incident-list"></div></div>
+          </section>
+          <div class="overview-side">
+            <section class="surface thermal" aria-labelledby="thermal-title">
+              <div class="panel-head"><div><h2 id="thermal-title">Температура</h2><p>Максимум по доступным датчикам</p></div><svg class="icon panel-icon" aria-hidden="true"><use href="#i-temp"/></svg></div>
+              <dl class="sensor-list" id="live-thermal"></dl>
+              <button type="button" class="text-button" data-limits>Температурные пределы<svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+            </section>
+            <section id="support" class="surface support" aria-labelledby="support-title" hidden>
+              <div class="panel-head"><h2 id="support-title">Поддержка автора</h2></div>
+              <p id="support-summary"></p>
+              <p id="support-recipient" class="mono"></p>
+              <p id="support-active" class="muted"></p>
+            </section>
+          </div>
+        </div>
+      </section>
+      <section id="workers" hidden>
+        <div class="section-header"><p id="worker-summary">Нет настроенных воркеров.</p><button type="button" data-limits><svg class="icon" aria-hidden="true"><use href="#i-temp"/></svg>Температурные пределы</button></div>
+        <div class="surface empty" id="workers-empty" hidden><h2>Воркеры ещё не добавлены</h2><p>Укажите устройства и адаптеры майнера в конфигурации на Linux.</p><button type="button" class="primary" data-setup>Настройка на Linux</button></div>
+        <div id="worker-grid" class="workers-grid" aria-label="Воркеры"></div>
+      </section>
+      <section id="events" hidden>
+        <div class="surface">
+          <div class="panel-head events-head"><div><h2>Журнал панели</h2><p>Действия оператора и события воркеров.</p></div><label>Тип события <select id="event-filter"><option value="">Все события</option><option value="thermal">Термозащита</option><option value="start">Запуск</option><option value="stop">Остановка</option><option value="exit">Завершение</option><option value="support">Поддержка</option><option value="profile">Профиль</option><option value="limits">Температурные пределы</option></select></label></div>
+          <p id="events-empty" class="empty-text">Загружаем события…</p>
+          <ol id="event-list" class="event-list"></ol>
+        </div>
+      </section>
+    </div>
+  </main>
+  <footer class="frame foot"><span>Apollo.NEB</span><span>Локальная панель · время браузера</span></footer>
+  <dialog id="profile-dialog" aria-labelledby="profile-title">
+    <div class="dialog-head"><h2 id="profile-title">Профиль пула</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p>Пул получает только публичный адрес NEB. Не вставляйте приватный ключ или seed-фразу.</p>
+    <form id="profile-form">
+      <label>Публичный адрес NEB<input id="wallet" required maxlength="62" placeholder="neb1…" spellcheck="false" autocomplete="off" autocapitalize="none"></label>
+      <label>Имя воркера<input id="worker-name" required maxlength="24" pattern="[A-Za-z0-9_\-]{1,24}" aria-describedby="worker-name-help" spellcheck="false" autocomplete="off" autocapitalize="none"></label>
+      <p id="worker-name-help" class="subline">До 24 латинских букв, цифр, дефисов или подчёркиваний.</p>
+      <label for="pool">Пул</label><select id="pool" required aria-describedby="pool-help"></select>
+      <p class="subline" id="pool-help">Список пулов задан в конфигурации Linux.</p>
+      <p id="profile-message" class="form-message" role="status"></p>
+      <button type="submit" class="primary" id="profile-save">Сохранить профиль</button>
+    </form>
+  </dialog>
+  <dialog id="limits-dialog" aria-labelledby="limits-title">
+    <div class="dialog-head"><h2 id="limits-title">Температурные пределы</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p>Термозащита останавливает воркер при перегреве. Выбирайте пределы по спецификации ваших устройств. Для памяти пустое поле означает, что отдельный предел не задан.</p>
+    <form id="limits-form">
+      <div class="limit-fields">
+        <label>Ядро, °C<input id="edge-limit" type="number" required min="55" max="80" step="1"></label>
+        <label>Hotspot, °C<input id="hot-limit" type="number" required min="65" max="100" step="1"></label>
+        <label>Память, °C<input id="hbm-limit" type="number" min="60" max="90" step="1" placeholder="Не задан"></label>
+      </div>
+      <label class="check"><input type="checkbox" id="limits-ack">Подтверждаю применение пределов</label>
+      <p id="limits-message" class="form-message" role="status"></p>
+      <button type="submit" id="limits-save" class="primary" disabled>Применить пределы</button>
+    </form>
+  </dialog>
+  <dialog id="setup-dialog" aria-labelledby="setup-title">
+    <div class="dialog-head"><h2 id="setup-title">Настройка на Linux</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p>В терминале того пользователя, который установил панель:</p>
+    <ol class="setup-list">
+      <li><p>Посмотрите доступные устройства и параметры настройки.</p><div class="command"><code>apollo-neb devices
+apollo-neb configure --help</code><button type="button" class="quiet" data-copy aria-label="Копировать команды настройки"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></li>
+      <li><p>Подготовьте локальный <code>workers.json</code> по примеру из поставки. Команда проверит его и сохранит в <code>${XDG_CONFIG_HOME:-$HOME/.config}/apollo-neb/</code>, если не указан другой путь. Используйте доверенный майнер.</p><div class="command"><code>apollo-neb configure --workers ./workers.json</code><button type="button" class="quiet" data-copy aria-label="Копировать команду импорта"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></li>
+      <li><p>После изменения конфигурации перезапустите пользовательскую службу. При ручном запуске остановите процесс в его терминале и снова выполните <code>apollo-neb serve</code>. Затем вернитесь в «Воркеры».</p><div class="command"><code>systemctl --user restart apollo-neb</code><button type="button" class="quiet" data-copy aria-label="Копировать команду перезапуска"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></li>
+    </ol>
+    <p id="copy-message" class="form-message" role="status"></p>
+  </dialog>
+  <template id="worker-template">
+    <article class="surface worker-card">
+      <div class="worker-head"><div><h2 data-field="label"></h2><p data-field="device" class="mono"></p></div><span data-field="state" class="state"></span></div>
+      <p data-field="rate" class="worker-rate"></p>
+      <dl class="worker-sensors">
+        <div><dt>Ядро</dt><dd data-field="edge"></dd></div>
+        <div><dt>Hotspot</dt><dd data-field="hot"></dd></div>
+        <div><dt>Память</dt><dd data-field="hbm"></dd></div>
+        <div><dt>Мощность</dt><dd data-field="watts"></dd></div>
+      </dl>
+      <p data-field="shares" class="worker-shares"></p>
+      <p data-field="message" class="worker-message"></p>
+      <div class="worker-actions"><button type="button" class="primary" data-worker-action="start">Запустить</button><button type="button" class="stop-button" data-worker-action="stop">Остановить</button></div>
+    </article>
+  </template>
+  <noscript><p class="frame">Для работы с панелью нужен JavaScript.</p></noscript>
+</body>
+</html>

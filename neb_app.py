@@ -1,0 +1,298 @@
+"""Loopback Apollo.NEB dashboard and supervised operator actions."""
+import json
+import logging
+import re
+import socket
+import sqlite3
+import threading
+import time
+from http.cookies import CookieError, SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import neb_core as core
+from neb_history import Archive
+
+HERE = Path(__file__).resolve().parent
+
+
+class Service:
+    def __init__(self, config, state, runtime, pools, support):
+        self.config, self.runtime = config, runtime
+        self.lock, self.stopping = threading.RLock(), threading.Event()
+        self.archive = Archive(state / "history.sqlite")
+        self.pools = core.pools(pools)
+        self.profile = core.chosen_profile(core.read(config / "profile.json", {
+            "wallet": "", "worker": "apollo", "pool": next(iter(self.pools))}),
+            self.pools, allow_empty=True)
+        self.limits = core.limits(core.read(config / "limits.json", core.LIMITS))
+        self.clock = core.SupportClock(core.support_config(support), state / "support-time.json")
+        self.last, self.rows = 0, []
+        self.suspended_support = set()
+        self.events = []
+
+    def add_event(self, kind, worker, detail, status):
+        self.events.append({"type": kind, "time": int(time.time()), "worker": worker,
+                            "detail": detail, "status": status})
+
+    def persist(self, at):
+        pending = [*self.events, *self.runtime.drain_events()]
+        self.events = pending
+        self.archive.tick(at, self.rows, pending)
+        self.events = []
+
+    def launch(self, id_, address):
+        pool = self.pools[self.profile["pool"]]["url"]
+        self.runtime.start(id_, {**self.profile, "wallet": core.wallet(address), "pool": pool}, limits=self.limits)
+
+    def change(self, command, body):
+        with self.lock:
+            if command in ("start", "stop"):
+                id_ = body.get("id")
+                if not isinstance(id_, str) or id_ not in {row["id"] for row in self.rows}:
+                    raise ValueError("Нет такого настроенного воркера.")
+                if command == "stop":
+                    self.runtime.stop(id_)
+                    self.clock.finish(id_)
+                else:
+                    self.launch(id_, self.profile["wallet"])
+                    self.suspended_support.discard(id_)
+            elif command == "profile":
+                if any(row["state"] == "running" for row in self.runtime.snapshot(self.limits)):
+                    raise ValueError("Остановите воркеры перед сменой адреса или пула.")
+                new = core.chosen_profile(body, self.pools)
+                if self.clock.cfg["enabled"] and new["wallet"] == self.clock.cfg["wallet"]:
+                    raise ValueError("Адрес добычи должен отличаться от адреса поддержки.")
+                core.store(self.config / "profile.json", new)
+                self.profile = new
+                self.add_event("profile", "", "Рабочий профиль обновлён.", "saved")
+            elif command == "limits":
+                if body.get("ack") is not True:
+                    raise ValueError("Подтвердите применение порогов.")
+                new = core.limits(body)
+                core.store(self.config / "limits.json", new)
+                self.limits = new
+                self.add_event("limits", "", "Настройки температурной защиты обновлены.", "saved")
+            self.rows = self.runtime.snapshot(self.limits)
+            self.last = int(time.time())
+            self.persist(self.last)
+
+    def switch_wallet(self, id_, mode, now):
+        if mode == "support":
+            self.clock.fund(id_, now)
+        try:
+            self.runtime.stop(id_)
+        except (RuntimeError, ValueError, OSError):
+            # Keep an outstanding support session marked active until a safe
+            # stop is confirmed; never launch a second worker after a refusal.
+            if mode == "support":
+                self.clock.finish(id_)
+            self.suspended_support.add(id_)
+            self.add_event("support", id_, "Остановка не подтверждена. Адрес не переключён.", "unconfirmed")
+            return
+        if mode == "operator":
+            self.clock.finish(id_)
+        address = self.clock.cfg["wallet"] if mode == "support" else self.profile["wallet"]
+        try:
+            self.launch(id_, address)
+            self.add_event("support", id_, "Начата сессия поддержки автора." if mode == "support"
+                           else "Возврат к адресу оператора.", "started")
+        except (RuntimeError, ValueError, OSError):
+            self.clock.finish(id_)
+            self.suspended_support.add(id_)
+            self.add_event("support", id_, "Перезапуск после смены адреса не подтверждён. Проверьте воркер.", "failed")
+
+    def poll(self, *, now=None):
+        with self.lock:
+            self.rows = self.runtime.snapshot(self.limits)
+            changed = False
+            monotonic = time.monotonic()
+            for row in self.rows:
+                id_, running = row["id"], row["state"] == "running"
+                if not running and id_ in self.clock.deadline:
+                    self.clock.finish(id_)
+                    self.suspended_support.add(id_)
+                    self.add_event("support", id_, "Сессия поддержки завершилась без перезапуска.", "ended")
+                # Custom binaries may not follow the Suprnova payout contract.
+                compatible = row["adapter"] in ("suprminer-opencl", "suprminer-cuda")
+                target = self.clock.observe(id_, running and compatible, monotonic)
+                if target == "operator" and id_ in self.suspended_support:
+                    # Retry only the stop, never an uncertain replacement.
+                    try:
+                        self.runtime.stop(id_)
+                    except (RuntimeError, ValueError, OSError):
+                        continue
+                    self.clock.finish(id_)
+                    self.add_event("support", id_, "Воркер остановлен. Для продолжения запустите его вручную.", "stopped")
+                    changed = True
+                elif target and id_ not in self.suspended_support:
+                    self.switch_wallet(id_, target, monotonic)
+                    changed = True
+            if changed:
+                self.rows = self.runtime.snapshot(self.limits)
+            at = int(time.time() if now is None else now)
+            self.persist(at)
+            self.last = at
+
+    def loop(self):
+        while not self.stopping.is_set():
+            try:
+                self.poll()
+            except (ValueError, RuntimeError, OSError, sqlite3.Error, KeyError) as exception:
+                logging.warning("Could not refresh Apollo.NEB snapshot (%s)", type(exception).__name__)
+            self.stopping.wait(2)
+
+    def status(self):
+        with self.lock:
+            return {"time": self.last, "workers": self.rows, "profile": self.profile,
+                    "pools": [{"id": p["id"], "label": p["label"]} for p in self.pools.values()],
+                    "limits": self.limits, "support": {**self.clock.cfg, "active_workers": self.clock.active()}}
+
+    def close(self):
+        self.stopping.set()
+        with self.lock:
+            try:
+                self.runtime.close()
+            finally:
+                self.clock.flush()
+
+
+def validated_origin(origin):
+    if origin is None:
+        return None
+    if not isinstance(origin, str) or not re.fullmatch(r"https://[A-Za-z0-9.\-]+(?::[0-9]{1,5})?", origin):
+        raise ValueError("Укажите внешний HTTPS origin без пути (например https://neb.example).")
+    p = urlsplit(origin)
+    if not p.hostname or (p.port is not None and p.port == 0):
+        raise ValueError("Недопустимый HTTPS origin.")
+    return origin
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, service, auth, web_dir, origin):
+        if address[0] != "127.0.0.1":
+            raise ValueError("Прямой доступ разрешён только с loopback.")
+        self.service, self.auth, self.public_origin = service, auth, validated_origin(origin)
+        self.assets = {}
+        for route, file, mime in (("/", "index.html", "text/html; charset=utf-8"),
+                                  ("/ui.css", "ui.css", "text/css; charset=utf-8"),
+                                  ("/ui.js", "ui.js", "text/javascript; charset=utf-8")):
+            self.assets[route] = ((web_dir / file).read_bytes(), mime)
+        super().__init__(address, Handler)
+        host = f"127.0.0.1:{self.server_port}"
+        self.origins = {host: "http://" + host}
+        if self.public_origin is not None:
+            self.origins[urlsplit(self.public_origin).netloc] = self.public_origin
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(8)
+        return connection, address
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        # Never log a request query or sensitive headers.
+        return
+
+    def respond(self, code, data, mime="application/json; charset=utf-8", *, cookie=None):
+        payload = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self';"
+                             " img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
+
+    def fail(self, code, message):
+        self.respond(code, {"error": message})
+
+    def origin(self):
+        hosts = self.headers.get_all("Host", [])
+        return self.server.origins.get(hosts[0]) if len(hosts) == 1 else None
+
+    def token(self):
+        try:
+            session = SimpleCookie(self.headers.get("Cookie", "")).get("neb_sid")
+            return session.value if session else None
+        except CookieError:
+            return None
+
+    def cookie(self, token, age):
+        secure = "; Secure" if self.origin().startswith("https://") else ""
+        return f"neb_sid={token}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}"
+
+    def do_GET(self):
+        if self.origin() is None:
+            return self.fail(403, "Недопустимый адрес панели.")
+        path = urlsplit(self.path)
+        asset = self.server.assets.get(path.path)
+        if asset:
+            return self.respond(200, *asset)
+        if path.path == "/favicon.ico":
+            return self.respond(204, b"")
+        try:
+            if not self.server.auth.valid(self.token()):
+                return self.fail(401, "Войдите в панель.")
+            service = self.server.service
+            if path.path == "/api/status":
+                return self.respond(200, service.status())
+            if path.path == "/api/events":
+                return self.respond(200, {"events": service.archive.events()})
+            if path.path == "/api/history":
+                selected = parse_qs(path.query, max_num_fields=2).get("range", ["30m"])[-1]
+                return self.respond(200, {**service.archive.history(selected), "limits": service.status()["limits"]})
+            self.fail(404, "Страница не найдена.")
+        except ValueError as error:
+            self.fail(400, str(error))
+        except (OSError, sqlite3.Error):
+            self.fail(503, "Данные временно недоступны.")
+
+    def do_POST(self):
+        origin = self.origin()
+        if origin is None or self.headers.get_all("Origin", []) != [origin]:
+            return self.fail(403, "Запрос пришёл не с адреса панели.")
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if (len(lengths) != 1 or not lengths[0].isdecimal() or not 1 <= int(lengths[0]) <= 4096
+                    or self.headers.get("Transfer-Encoding") or self.headers.get_content_type() != "application/json"):
+                return self.fail(400, "Ожидается запрос JSON до 4 КиБ.")
+            body = json.loads(self.rfile.read(int(lengths[0])))
+            if not isinstance(body, dict):
+                return self.fail(400, "Ожидается объект JSON.")
+        except (ValueError, OSError):
+            return self.fail(400, "Не удалось прочитать запрос.")
+        auth, token = self.server.auth, self.token()
+        try:
+            if self.path == "/api/login":
+                try:
+                    token = auth.enter(body.get("password"), body.get("code"))
+                except ValueError as error:
+                    return self.fail(401, str(error))
+                return self.respond(200, {"ok": True}, cookie=self.cookie(token, core.SESSION_SECONDS))
+            if not auth.valid(token):
+                return self.fail(401, "Войдите в панель.")
+            if self.path == "/api/logout":
+                auth.revoke(token)
+                return self.respond(200, {"ok": True}, cookie=self.cookie("", 0))
+            actions = {"/api/start": "start", "/api/stop": "stop", "/api/profile": "profile", "/api/limits": "limits"}
+            if self.path not in actions:
+                return self.fail(404, "Действие не найдено.")
+            self.server.service.change(actions[self.path], body)
+            self.respond(200, {"ok": True})
+        except (RuntimeError, ValueError) as error:
+            self.fail(409, str(error))
+        except (OSError, sqlite3.Error):
+            self.fail(503, "Результат не подтверждён. Проверьте состояние перед повтором.")

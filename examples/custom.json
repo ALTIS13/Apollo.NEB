@@ -1,0 +1,10 @@
+[
+  {
+    "id": "custom-1",
+    "label": "Свой майнер · пример интерфейса",
+    "adapter": "custom",
+    "binary": "/absolute/path/to/your-trusted-miner",
+    "args": ["--pool", "{pool}", "--user", "{wallet}.{worker}"],
+    "log_format": "json-lines"
+  }
+]

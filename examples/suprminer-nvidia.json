@@ -1,0 +1,10 @@
+[
+  {
+    "id": "nvidia-1",
+    "label": "NVIDIA · настройте PCI",
+    "adapter": "suprminer-cuda",
+    "binary": "/absolute/path/suprminer-neptune",
+    "dataset": "/absolute/path/neb-datasets.bin",
+    "device": "0000:01:00.0"
+  }
+]
