@@ -522,6 +522,7 @@ function renderChartEvents(markers) {
 
 function openChartEvent(event = null) {
   $("event-filter").value = event?.type || "";
+  syncStyledSelect($("event-filter"));
   state.focusEvent = event?.id ?? null;
   state.eventsError = "";
   setView("events", true);
@@ -1452,6 +1453,7 @@ function openProfile(address) {
     return option;
   }));
   if (inList(pools).some(pool => pool.id === profile?.pool)) $("pool").value = profile.pool;
+  syncStyledSelect($("pool"));
   $("profile-save").disabled = !inList(pools).length;
   text($("profile-message"), inList(pools).length ? "" : "На сервере не настроено ни одного пула.");
   $("profile-dialog").showModal();

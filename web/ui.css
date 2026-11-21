@@ -241,6 +241,88 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 form { display: grid; gap: 11px; margin-top: 14px; }
 label { display: grid; gap: 4px; color: var(--muted); font-size: .85rem; }
 input, select { width: 100%; min-width: 0; min-height: 40px; border: 1px solid var(--control); border-radius: 7px; color: var(--ink); background: var(--inset); padding: 7px 10px; caret-color: var(--mint); }
+select.select-menu-native { display: none; }
+.select-menu { display: block; min-inline-size: 0; max-inline-size: 100%; }
+.chart-controls .select-menu { inline-size: 8rem; }
+.chart-controls #metric + .select-menu, .events-head .select-menu { inline-size: 12rem; }
+.events-head label { max-inline-size: 100%; min-inline-size: 0; }
+.select-menu-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-block-size: 40px;
+  padding: 6px 10px;
+  border: 1px solid var(--control);
+  border-radius: 7px;
+  background: var(--inset);
+  color: var(--ink);
+  font-size: .87rem;
+  font-weight: 550;
+  line-height: 1.3;
+  cursor: pointer;
+}
+.chart-controls .select-menu-button { min-block-size: 34px; }
+.select-menu-value { min-inline-size: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.select-menu-button::after {
+  content: "";
+  flex: none;
+  inline-size: 7px;
+  block-size: 7px;
+  margin-inline: 2px;
+  border: solid var(--muted);
+  border-width: 0 1.5px 1.5px 0;
+  transform: translateY(-2px) rotate(45deg);
+}
+.select-menu-button[aria-expanded="true"]::after { transform: translateY(2px) rotate(225deg); }
+.select-menu-button:is(:hover, [aria-expanded="true"]):not([aria-disabled="true"]) { border-color: var(--blue); }
+.select-menu-button:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
+.select-menu-button[aria-invalid="true"] { border-color: var(--red); }
+.select-menu-button[aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
+.select-menu-error { display: block; margin-top: 5px; color: var(--red); font-size: .8rem; }
+.select-options {
+  position: fixed;
+  inset: auto;
+  z-index: 10;
+  max-inline-size: calc(100vw - 16px);
+  margin: 0;
+  padding: 4px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  list-style: none;
+  border: 1px solid var(--control);
+  border-radius: 8px;
+  box-shadow: 0 8px 20px #0007;
+  background: var(--surface);
+  color: var(--ink);
+}
+.select-option {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-block-size: 34px;
+  padding: 6px 28px 6px 9px;
+  border-radius: 4px;
+  font-size: .86rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.select-option[aria-disabled="true"] { color: var(--muted); opacity: .65; cursor: not-allowed; }
+.select-option[aria-selected="true"] { background: var(--green); color: var(--mint); }
+.select-option[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  inset-inline-end: 10px;
+  inset-block-start: calc(50% - 6px);
+  inline-size: 5px;
+  block-size: 8px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.select-option:not([aria-disabled="true"]):not([aria-selected="true"]):is([data-active], :hover) { background: #203240; }
+.select-option[data-active] { outline: 1px solid var(--blue); outline-offset: -1px; }
 .subline { color: var(--muted); font-size: .77rem; }
 .form-message { color: var(--amber); font-size: .85rem; margin: 0; overflow-wrap: anywhere; }
 .form-message:empty { display: none; }
@@ -336,6 +418,9 @@ input[type="checkbox"] { width: 17px; min-height: 17px; height: 17px; margin: 0;
   .chart-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .chart-controls label { display: grid; gap: 3px; }
   .chart-controls select { width: 100%; min-height: 40px; }
+  .chart-controls .select-menu, .chart-controls #metric + .select-menu { inline-size: 100%; }
+  .chart-controls .select-menu-button { min-block-size: 40px; }
+  .select-option { min-block-size: 42px; }
   .recovery-codes { grid-template-columns: 1fr; }
   .page-header .page-actions button { padding-inline: 8px; gap: 5px; }
   .views { gap: 4px; margin-bottom: 12px; }

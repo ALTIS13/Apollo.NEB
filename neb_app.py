@@ -317,6 +317,7 @@ class Server(ThreadingHTTPServer):
             self.assets["/view.js"] = ((web_dir / "view.js").read_bytes(), "text/javascript; charset=utf-8")
             self.assets["/live-metrics.js"] = ((web_dir / "live-metrics.js").read_bytes(), "text/javascript; charset=utf-8")
             self.assets["/history-chart.js"] = ((web_dir / "history-chart.js").read_bytes(), "text/javascript; charset=utf-8")
+            self.assets["/select-menu.js"] = ((web_dir / "select-menu.js").read_bytes(), "text/javascript; charset=utf-8")
         super().__init__(address, Handler)
         host = f"127.0.0.1:{self.server_port}"
         self.origins = {host: "http://" + host}
