@@ -2,6 +2,7 @@ from itertools import count
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,32 @@ class WorkerConfigTests(unittest.TestCase):
         card["index"] = 6
         with self.assertRaises(ValueError):
             runtime._argv(worker, PROFILE, Path("/bin/true"), card, {})
+
+    def test_wsl_nvidia_uses_dxg_and_requires_current_temperature(self):
+        info = SimpleNamespace(st_mode=stat.S_IFCHR, st_dev=7, st_ino=32, st_rdev=4352)
+        dxg = SimpleNamespace(lstat=lambda: info)
+        system = SimpleNamespace(release="6.6.87.2-microsoft-standard-WSL2")
+        gpu_a = "GPU-12345678-9abc-0000-0000-000000000001"
+        raw = f"00000000:04:00.0, 0, {gpu_a}, 43, 22.4"
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(runtime, "PCI_PATH", Path(folder)),
+              patch.object(runtime, "DXG_PATH", dxg, create=True),
+              patch.object(runtime.os, "uname", return_value=system, create=True),
+              patch.object(runtime.sys, "platform", "linux"),
+              patch.object(runtime.subprocess, "run", return_value=SimpleNamespace(stdout=raw)) as smi):
+            cards = runtime.discover_devices()
+            self.assertEqual(len(cards), 1)
+            card = cards[0]
+            self.assertEqual((card["device"], card["vendor"], card["edge"], card["watts"]), (GPU, "nvidia", 43, 22.4))
+            self.assertEqual(card["_uuid"], gpu_a)
+            self.assertEqual(smi.call_args.args[0][0], "/usr/lib/wsl/lib/nvidia-smi")
+            self.assertIsNone(runtime._thermal(card, runtime._limits({})))
+            smi.return_value.stdout = raw.replace(", 43,", ", [N/A],")
+            self.assertIn("unavailable", runtime._thermal(runtime.discover_devices()[0], runtime._limits({})))
+            smi.return_value.stdout = raw + "\n00000000:05:00.0, 1, " + gpu_a + ", 40, 20"
+            self.assertEqual(runtime.discover_devices(), [])
+            info.st_mode = stat.S_IFREG
+            self.assertEqual(runtime.discover_devices(), [])
 
     def test_opencl_refuses_driver_with_ambiguous_or_unfiltered_device_binding(self):
         worker = runtime.validate_workers([dict(id="opencl", adapter="suprminer-opencl", binary="/bin/true",

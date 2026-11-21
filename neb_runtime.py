@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections import Counter
 import csv
 from dataclasses import dataclass, field
 import json
@@ -26,6 +27,8 @@ class Refusal(ValueError):
 
 
 PCI_PATH = Path("/sys/bus/pci/devices")
+DXG_PATH = Path("/dev/dxg")
+WSL_NVIDIA_SMI = "/usr/lib/wsl/lib/nvidia-smi"
 PCI = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 SLUG = re.compile(r"[A-Za-z0-9_-]{1,32}")
 UUID = re.compile(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
@@ -143,8 +146,8 @@ def _hwmon(card, expected_name):
     return metrics
 
 
-def _nvidia_smi():
-    cmd = shutil.which("nvidia-smi")
+def _nvidia_smi(cmd=None):
+    cmd = cmd or shutil.which("nvidia-smi")
     if not cmd:
         return {}
     try:
@@ -171,7 +174,31 @@ def _nvidia_smi():
     return {bdf: row for bdf, row in results.items() if bdf not in ambiguous}
 
 
+def _wsl_gpu_identity():
+    if sys.platform != "linux" or not os.uname().release.lower().endswith("-microsoft-standard-wsl2"):
+        return None
+    try:
+        device = DXG_PATH.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISCHR(device.st_mode):
+        return None
+    return (device.st_dev, device.st_ino, device.st_rdev)
+
+
 def _scan_devices():
+    dxg = _wsl_gpu_identity()
+    if dxg is not None:
+        # WSL exposes the host GPU through DXG instead of PCI sysfs.
+        cards = _nvidia_smi(WSL_NVIDIA_SMI)
+        uuids = Counter(row["_uuid"].lower() for row in cards.values())
+        indices = Counter(row["index"] for row in cards.values())
+        return [
+            dict(device=bdf, vendor="nvidia", _identity=dxg, hot=None, hbm=None, **row)
+            for bdf, row in sorted(cards.items())
+            if uuids[row["_uuid"].lower()] == 1 and indices[row["index"]] == 1
+        ]
+
     nvidia = None
     rows = []
     for card in sorted(PCI_PATH.glob("*")):
