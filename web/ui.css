@@ -44,6 +44,9 @@ p, dt, .muted { color: var(--muted); }
 .connection i, .state::before, .event-key i { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
 .connection[data-tone="good"] i { color: var(--mint); box-shadow: 0 0 0 3px #23453a; }
 .connection[data-tone="warn"] i { color: var(--amber); }
+.devfee { padding: 3px 8px; border-radius: 999px; background: var(--inset); }
+.devfee[data-tone="good"] { color: var(--mint); }
+.devfee[data-tone="warn"] { color: var(--amber); }
 main { min-height: calc(100vh - 130px); }
 .page-header { display: flex; justify-content: space-between; align-items: end; gap: 16px; margin: 28px 0 12px; }
 .page-header h1 { margin-top: 5px; }
@@ -242,7 +245,7 @@ input[type="checkbox"] { width: 17px; min-height: 17px; height: 17px; margin: 0;
   .top-inner { min-height: 55px; }
   .brand { gap: 7px; }
   .brand-mark { width: 29px; height: 29px; }
-  .top-tools { gap: 8px; }
+  .top-tools { gap: 6px 8px; flex-wrap: wrap; justify-content: flex-end; }
   .connection { font-size: .72rem; }
   .page-header { margin-top: 20px; align-items: start; flex-wrap: wrap; gap: 7px 10px; }
   .profile-button { min-height: 34px; }

@@ -62,6 +62,16 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(time.observe("cpu", True, 1000))
         self.assertFalse(time.active())
 
+    def test_half_percent_requires_59700_active_seconds_for_one_window(self):
+        cfg = core.support_config({"enabled": True, "wallet": SUPPORT, "basis_points": 50})
+        clock = core.SupportClock(cfg, self.base / "fee-time.json")
+        for elapsed in range(0, 59700, 5):
+            self.assertIsNone(clock.observe("gpu", True, elapsed))
+        self.assertEqual(clock.observe("gpu", True, 59700), "support")
+        clock.fund("gpu", 59700)
+        self.assertIsNone(clock.observe("gpu", True, 59999))
+        self.assertEqual(clock.observe("gpu", True, 60000), "operator")
+
     def test_auth_password_totp_and_server_side_revoke(self):
         key = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
         auth = core.Auth(core.new_login("test fixture password", key), self.base / "auth.sqlite")

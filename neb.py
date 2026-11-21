@@ -52,6 +52,13 @@ def settings_path(cfg):
     return cfg / "settings.json"
 
 
+def release_support():
+    policy = core.read(HERE / "developer-support.json", {})
+    if not isinstance(policy, dict) or policy.get("basis_points") != 50:
+        raise ValueError("Установите целый официальный пакет с политикой DevFee 0,5%.")
+    return core.support_config({"enabled": True, "basis_points": policy["basis_points"], "wallet": policy.get("wallet")})
+
+
 def configure(args):
     cfg, state = paths(args)
     target = args.publish_current
@@ -98,19 +105,8 @@ def configure_locked(args, cfg, state):
         if value is not None:
             profile[key] = value
     profile = core.chosen_profile(profile, checked_pools, allow_empty=args.wallet is None)
-    support = old.get("support", {"enabled": False})
-    if args.disable_support:
-        if args.support_wallet or args.support_bps is not None or args.accept_support:
-            raise ValueError("Нельзя одновременно включить и выключить поддержку.")
-        support = {"enabled": False}
-    elif args.support_wallet or args.support_bps is not None or args.accept_support:
-        if args.accept_support is not True:
-            raise ValueError("Укажите получателя, долю и явное согласие --accept-support; см. --help.")
-        recommendation = core.read(HERE / "developer-support.json", {})
-        support = {"enabled": True, "wallet": args.support_wallet or recommendation.get("wallet"),
-                   "basis_points": args.support_bps if args.support_bps is not None else recommendation.get("basis_points")}
-    checked_support = core.support_config(support)
-    if checked_support["enabled"] and checked_support["wallet"] == profile["wallet"]:
+    support = release_support()
+    if support["wallet"] == profile["wallet"]:
         raise ValueError("Адрес поддержки и адрес добычи не могут совпадать.")
     origin = neb_app.validated_origin(args.origin if args.origin is not None else old.get("origin"))
     port = args.port if args.port is not None else old.get("port", 18763)
@@ -130,16 +126,13 @@ def configure_locked(args, cfg, state):
     private(cfg)
     if not login_path.exists():
         core.store(login_path, login)
-    core.store(settings_path(cfg), {"origin": origin, "port": port, "support": support})
+    core.store(settings_path(cfg), {"origin": origin, "port": port})
     core.store(cfg / "profile.json", profile)
     core.store(cfg / "pools.json", list(checked_pools.values()))
     core.store(cfg / "workers.json", workers)
     core.store(cfg / "limits.json", limits)
     print(f"Настройки: {cfg}\nАдрес панели: http://127.0.0.1:{port}\nВоркеров: {len(workers)}. Майнинг не запущен.")
-    if checked_support["enabled"]:
-        print(f"Поддержка автора: {checked_support['basis_points'] / 100:.2f}% времени; {checked_support['wallet']}")
-    else:
-        print("Поддержка автора выключена. Комиссии Apollo.NEB нет.")
+    print(f"DevFee: 0,5% активного времени; {support['wallet']}")
     enroll(enrollment)
 
 
@@ -185,18 +178,6 @@ def rotate_password(args):
         print("Пароль обновлён. Прежние сессии отозваны.")
 
 
-def supervised():
-    try:
-        membership = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-        if not any(line.endswith("/apollo-neb.service") for line in membership.splitlines()):
-            return False
-        command = subprocess.run(["systemctl", "--user", "show", "--property=KillMode",
-                                  "--value", "apollo-neb.service"], capture_output=True, text=True, timeout=3)
-        return command.returncode == 0 and command.stdout.strip() == "control-group"
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
 def serve(args):
     import neb_fleet
     cfg, state = paths(args)
@@ -207,6 +188,7 @@ def serve(args):
     port = settings["port"]
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Укажите допустимый непривилегированный порт.")
+    support = release_support()
     private(cfg)
     private(state)
     with lock_state(state):
@@ -215,10 +197,6 @@ def serve(args):
             raise ValueError("Внешний адрес допускается только с TOTP.")
         workers = neb_runtime.validate_workers(core.read(cfg / "workers.json", []))
         runtime = neb_runtime.Manager(workers, state)
-        support = settings.get("support")
-        if core.support_config(support)["enabled"] and not supervised():
-            print("Поддержка автора отключена вне управляемой службы systemd.", file=sys.stderr)
-            support = None
         service = neb_app.Service(cfg,state,runtime,core.read(cfg/"pools.json",core.DEFAULT_POOLS),support,
                                   setup=neb_setup.Setup(state),wallets=neb_wallet.WalletStore(state),
                                   releases=neb_release.Releases(),fleet=neb_fleet.Fleet(state/"fleet.sqlite"))
@@ -298,7 +276,8 @@ def main():
     parser.add_argument("--config-dir", type=Path, help="явный путь вместо XDG_CONFIG_HOME")
     parser.add_argument("--state-dir", type=Path, help="явный путь вместо XDG_STATE_HOME")
     sub = parser.add_subparsers(dest="action", required=True)
-    command = sub.add_parser("configure", help="проверить и сохранить параметры")
+    command = sub.add_parser("configure", help="проверить и сохранить параметры",
+                             description="Официальный пакет использует DevFee 0,5% активного времени. Майнинг запускаете вы.")
     command.add_argument("--wallet", help="публичный адрес NEB Mainnet")
     command.add_argument("--worker", help="метка воркера в пуле")
     command.add_argument("--pool", help="идентификатор из pools.json")
@@ -306,10 +285,6 @@ def main():
     command.add_argument("--workers", type=Path, help="импорт списка воркеров из JSON")
     command.add_argument("--port", type=int, help="порт HTTP на 127.0.0.1 (по умолчанию 18763)")
     command.add_argument("--origin", help="внешний HTTPS origin (только за своим обратным прокси)")
-    command.add_argument("--support-wallet", help="публичный NEB-адрес автора")
-    command.add_argument("--support-bps", type=int, help="доля времени: 50 = 0,5%%, предел 100")
-    command.add_argument("--accept-support", action="store_true", help="подтвердить поддержку автора и использовать указанный адрес")
-    command.add_argument("--disable-support", action="store_true", help="выключить поддержку автора")
     command.add_argument("--totp", action="store_true", help="на первой установке подключить двухфакторный вход")
     command.add_argument("--password-stdin", action="store_true", help="для автоматизации: прочитать пароль из stdin, не передавать в аргументах")
     command.add_argument("--publish-current",type=Path,help=argparse.SUPPRESS)

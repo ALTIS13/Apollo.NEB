@@ -1,4 +1,4 @@
-"""Configuration, local admin sessions and opt-in support accounting."""
+"""Configuration, local admin sessions and DevFee time accounting."""
 import base64
 import hashlib
 import hmac
@@ -156,8 +156,13 @@ class SupportClock:
             self.flushed_at = now
 
     def fund(self, id_, now):
-        self.credit[id_] = max(0., self.credit[id_] - self.window)
-        self.flush()
+        previous = self.credit[id_]
+        self.credit[id_] = max(0., previous - self.window)
+        try:
+            self.flush()
+        except OSError:
+            self.credit[id_] = previous
+            raise
         self.deadline[id_] = now + self.window
 
     def finish(self, id_):

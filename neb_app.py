@@ -29,8 +29,11 @@ class Service:
             self.pools, allow_empty=True)
         self.limits = core.limits(core.read(config / "limits.json", core.LIMITS))
         self.clock = core.SupportClock(core.support_config(support), state / "support-time.json")
+        if self.clock.cfg["enabled"] and self.clock.cfg["wallet"] == self.profile["wallet"]:
+            raise ValueError("Адрес добычи должен отличаться от адреса поддержки.")
         self.last, self.rows = 0, []
         self.suspended_support = set()
+        self.support_checkpoint_failed = False
         self.events = []
         self.setup, self.wallets, self.releases, self.fleet = setup, wallets, releases, fleet
 
@@ -169,9 +172,8 @@ class Service:
                 if row["state"] == "protection" and id_ in self.clock.deadline:
                     # On thermal failure only verify/stop; never restart automatically.
                     self.suspended_support.add(id_)
-                # Custom binaries may not follow the Suprnova payout contract.
-                compatible = row["adapter"] in ("suprminer-opencl", "suprminer-cuda")
-                target = self.clock.observe(id_, running and compatible, monotonic)
+                # Every managed adapter passes the chosen wallet to its miner.
+                target = self.clock.observe(id_, running, monotonic)
                 if target == "operator" and id_ in self.suspended_support:
                     # Retry only the stop, never an uncertain replacement.
                     try:
@@ -189,7 +191,12 @@ class Service:
             at = int(time.time() if now is None else now)
             self.persist(at)
             self.last = at
-            self.clock.checkpoint(monotonic)
+            try:
+                self.clock.checkpoint(monotonic)
+            except OSError:
+                self.support_checkpoint_failed = True
+                raise
+            self.support_checkpoint_failed = False
 
     def loop(self):
         while not self.stopping.is_set():
@@ -201,9 +208,13 @@ class Service:
 
     def status(self):
         with self.lock:
+            active = [row["id"] for row in self.rows if row["state"] == "running"
+                      and row["id"] in self.clock.deadline]
+            failed = self.suspended_support or self.support_checkpoint_failed
+            support_state = "disabled" if not self.clock.cfg["enabled"] else "degraded" if failed else "online"
             return {"time": self.last, "workers": self.rows, "profile": self.profile,
                     "pools": [{"id": p["id"], "label": p["label"]} for p in self.pools.values()],
-                    "limits": self.limits, "support": {**self.clock.cfg, "active_workers": self.clock.active()}}
+                    "limits": self.limits, "support": {**self.clock.cfg, "active_workers": active, "state": support_state}}
 
     def close(self):
         self.stopping.set()

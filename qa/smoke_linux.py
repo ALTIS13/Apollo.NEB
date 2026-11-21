@@ -43,7 +43,10 @@ def eventually(get, seconds=10):
 def test(directory):
     prefix, config, state = (directory / k for k in ("prefix", "cfg", "state"))
     fixture = directory / "fixture.py"
-    fixture.write_text("#!/usr/bin/env python3\nimport json, time\n"
+    payouts = directory / "payouts.jsonl"
+    fixture.write_text("#!/usr/bin/env python3\nimport json, sys, time\n"
+                       f"with open({str(payouts)!r}, 'a', encoding='utf-8') as receipt:\n"
+                       "    receipt.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                        "while True:\n"
                        "    print(json.dumps({'rate_hs': 1250000, 'accepted': 7, 'rejected': 0}), flush=True)\n"
                        "    time.sleep(0.2)\n", encoding="utf-8")
@@ -66,14 +69,17 @@ def test(directory):
                              input=password + "\n", text=True, capture_output=True, timeout=5)
     assert refused.returncode != 0 and shared.stat().st_mode & 0o777 == 0o755
     assert not (shared / "service.lock").exists() and not config.exists()
-    subprocess.run(["/bin/sh", str(SOURCE / "install.sh"), "--prefix", str(prefix),
+    installed = subprocess.run(["/bin/sh", str(SOURCE / "install.sh"), "--prefix", str(prefix),
                     "--config-dir", str(config), "--state-dir", str(state), "--",
                     "--wallet", SYNTHETIC_NEVER_PAID, "--workers", str(workers),
                     "--pools", str(test_pool), "--pool", "offline", "--port", str(port), "--password-stdin"],
-                   input=password + "\n", text=True, check=True, timeout=12)
+                   input=password + "\n", text=True, check=True, timeout=12, capture_output=True)
     launcher = prefix / "bin" / "apollo-neb"
     assert (config / "login.json").stat().st_mode & 0o077 == 0
-    service = subprocess.Popen([str(launcher), "--config-dir", str(config), "--state-dir", str(state), "serve"])
+    args = ["--config-dir", str(config), "--state-dir", str(state)]
+    recipient = json.loads((SOURCE / "developer-support.json").read_text(encoding="utf-8"))["wallet"]
+    expected = {"enabled": True, "basis_points": 50, "wallet": recipient}
+    service = subprocess.Popen([str(launcher), *args, "serve"])
     try:
         assert eventually(lambda: request(port, "GET", "/")[0] == 200)
         assert request(port, "GET", "/api/status")[0] == 401
@@ -86,7 +92,8 @@ def test(directory):
             assert code == 200
             status = json.loads(data)
             assert status["profile"]["wallet"] == SYNTHETIC_NEVER_PAID
-            assert status["support"]["enabled"] is False
+            assert all(status["support"][k] == v for k,v in expected.items()), "Fresh install must run with the release DevFee policy."
+            assert status["support"]["state"] == "online"
             return status["workers"][0]
 
         assert get_status()["state"] == "stopped"
@@ -103,16 +110,49 @@ def test(directory):
     finally:
         service.terminate()
         service.wait(timeout=10)
-    recommendation = json.loads((SOURCE / "developer-support.json").read_text(encoding="utf-8"))
-    assert not json.loads((config / "settings.json").read_text(encoding="utf-8"))["support"]["enabled"]
-    opts = [str(launcher), "--config-dir", str(config), "--state-dir", str(state), "configure"]
-    subprocess.run([*opts, "--accept-support"], text=True, check=True, timeout=5,
-                   capture_output=True)
-    accepted = json.loads((config / "settings.json").read_text(encoding="utf-8"))["support"]
-    assert accepted == {"enabled": True, "basis_points": 50, "wallet": recommendation["wallet"]}
-    subprocess.run([*opts, "--disable-support"], text=True, check=True, timeout=5,
-                   capture_output=True)
-    print("PASS: fresh Linux install, auth, isolated offline worker, telemetry, start/stop and logout.")
+    assert installed.stdout.index("0.5%") < installed.stdout.index("Preparing the administrator account")
+    assert subprocess.run([str(launcher), *args, "configure", "--disable-support"], text=True,
+                          timeout=5, capture_output=True).returncode == 2
+    # Reopen as an upgrade with the former settings, then exercise an available
+    # balance without waiting 16 hours. Only the test process shortens the window.
+    settings = config / "settings.json"
+    settings.write_text(json.dumps({**json.loads(settings.read_text()), "support": {"enabled": False}}))
+    window = 6
+    (state / "support-time.json").write_text(json.dumps({"config": expected, "credit": {"fixture": window}}))
+    installed_code = prefix / "lib" / "apollo-neb" / "current"
+    expedite = (
+        "import sys\nsys.path.insert(0,sys.argv.pop(1))\nimport neb,neb_core\n"
+        "original=neb_core.SupportClock\n"
+        "window=int(sys.argv.pop(1))\n"
+        "neb_core.SupportClock=lambda config,path: original(config,path,window=window)\n"
+        "raise SystemExit(neb.main())\n"
+    )
+    # Clear the previous smoke phase's receipt; its confirmed stop is above.
+    payouts.write_text("")
+    service = subprocess.Popen(["python3", "-I", "-c", expedite, str(installed_code), str(window), *args, "serve"])
+    try:
+        assert eventually(lambda: request(port, "GET", "/")[0] == 200)
+        code, _, raw_cookie = request(port, "POST", "/api/login", {"password": password})
+        assert code == 200
+        cookie = raw_cookie.split(";", 1)[0]
+
+        def launches():
+            return [json.loads(line) for line in payouts.read_text().splitlines() if line]
+
+        assert get_status()["state"] == "stopped" and not launches()
+        assert request(port, "POST", "/api/start", {"id":"fixture"}, cookie)[0] == 200
+        eventually(lambda: len(launches()) >= 2)
+        support = json.loads(request(port, "GET", "/api/status", cookie=cookie)[1])["support"]
+        assert support["active_workers"] == ["fixture"]
+        eventually(lambda: len(launches()) >= 3, seconds=window+8)
+        assert launches() == [[address,"stratum+tcp://127.0.0.1:1"]
+                              for address in (SYNTHETIC_NEVER_PAID, recipient, SYNTHETIC_NEVER_PAID)]
+        assert not json.loads(request(port, "GET", "/api/status", cookie=cookie)[1])["support"]["active_workers"]
+        assert request(port, "POST", "/api/stop", {"id":"fixture"}, cookie)[0] == 200
+    finally:
+        service.terminate()
+        service.wait(timeout=10)
+    print("PASS: rootless install, authenticated offline miner, default DevFee, old settings ignored, both wallet switches.")
 
 
 if __name__ == "__main__":

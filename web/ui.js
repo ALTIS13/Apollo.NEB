@@ -120,7 +120,7 @@ function showLogin(expired = false) {
   for (const id of ["worker-grid", "event-list", "chart-svg", "incident-list", "live-thermal"]) $(id).replaceChildren();
   for (const id of ["profile-form", "limits-form", "login-form"]) $(id).reset();
   for (const dialog of all("dialog[open]")) dialog.close();
-  $("boot").hidden = $("app").hidden = $("logout").hidden = true;
+  $("boot").hidden = $("app").hidden = $("logout").hidden = $("devfee").hidden = true;
   $("login").hidden = false;
   text($("login-message"), expired ? "Сеанс завершён. Войдите снова." : "");
   connection("Вход в панель", "neutral");
@@ -209,16 +209,21 @@ function renderStatus() {
   all("[data-profile]").forEach(button => button.classList.toggle("primary", !profile?.wallet));
   $("first-run").querySelector("[data-discovery]").classList.toggle("primary", Boolean(profile?.wallet && !workers.length));
   const supportPercent = fmt(support?.basis_points / 100, "%", 2);
-  const runtimeShare = `Включена оператором: до ${supportPercent} рабочего времени воркера выделяется автору. Это не удержание из выплат.`;
-  text($("setup-support"), support?.enabled ? `Поддержка автора. ${runtimeShare}`
-    : "Поддержка автора: выключена, 0 % рабочего времени. Включается только явно в конфигурации Linux.");
+  const liveFee = state.online && support?.state === "online";
+  const feeLabel = liveFee ? "DevFee online" : state.online ? "DevFee · нужна проверка" : "DevFee · нет связи";
+  $("devfee").hidden = !support?.enabled;
+  $("devfee").dataset.tone = liveFee ? "good" : "warn";
+  text($("devfee-label"), feeLabel);
+  const runtimeShare = `${supportPercent} активного времени майнинга выделяется автору. С выплат ничего не списывается.`;
+  text($("setup-support"), support?.enabled ? `${feeLabel}. ${runtimeShare}` : "");
+  $("setup-support").hidden = !support?.enabled;
   $("support").hidden = !support?.enabled || !$("first-run").hidden;
   text($("support-summary"), runtimeShare);
   text($("support-recipient"), support?.enabled && support.wallet ? `Получатель: ${support.wallet}` : "");
   const onSupport = inList(support?.active_workers);
-  text($("support-active"), onSupport.length
-    ? `Сейчас: ${onSupport.map(id => workers.find(worker => worker.id === id)?.label || id).join(", ")}. Сводка учитывает их работу.`
-    : "Сейчас ни один воркер не участвует.");
+  text($("support-active"), !state.online ? "Нет свежих данных о воркерах."
+    : onSupport.length ? `Окно DevFee: ${onSupport.map(id => workers.find(worker => worker.id === id)?.label || id).join(", ")}.`
+    : liveFee ? "Сейчас нет активного окна DevFee." : "Проверьте журнал событий и место на диске.");
   const alerts = workers.filter(worker => ["protection", "failed", "blocked", "unavailable"].includes(worker.state));
   const nearby = devices
     .flatMap(worker => TEMPERATURES.map(key => ({worker, key, tone: thermalTone(worker[key], limits?.[`${key}_limit`])})))

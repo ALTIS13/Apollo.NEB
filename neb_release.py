@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 
 from neb_setup import Asset, download, file_digest
 
-VERSION = "0.7.0-rc.1"
+VERSION = "0.7.1-rc.1"
 REPO = "ALTIS13/Apollo.NEB"
 RELEASES = f"https://github.com/{REPO}/releases"
 REMOTE = f"repos/{REPO}/releases?per_page=20"

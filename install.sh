@@ -7,6 +7,7 @@ neb_cfg=
 neb_state=
 service=0
 run_now=0
+fee_notice='DevFee: 0.5% of active mining time uses the author’s NEB wallet; not a deduction from payouts.'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help)
@@ -14,6 +15,7 @@ while [ "$#" -gt 0 ]; do
         './install.sh [--run | --service] [--prefix PATH] [--config-dir PATH] [--state-dir PATH] -- [configure options]' \
         '--run: open the local dashboard now; configure wallets and GPUs in the browser.' \
         '--service: install and start the user service; workers do not start automatically.' \
+        "$fee_notice" \
         'Examples: ./install.sh; ./install.sh --service -- --wallet YOUR_NEB_MAINNET_ADDRESS --totp' \
         'Run ./install.sh -- --help for configuration options.'
       exit 0 ;;
@@ -36,6 +38,7 @@ fi
 test "$(id -u)" -ne 0 || { printf '%s\n' 'Run as a dedicated regular Linux user, without sudo.' >&2; exit 1; }
 test "$((service+run_now))" -le 1 || { printf '%s\n' 'Choose either --run or --service.' >&2; exit 2; }
 printf '\n%s\n' 'APOLLO.NEB  /  LOCAL MINING' '01 / Checking Linux and installation paths'
+printf '%s\n' "$fee_notice" 'Mining only begins when you start a worker.'
 case "$neb_prefix" in /*) ;; *) printf 'Prefix must be absolute.\n' >&2; exit 2;; esac
 case "${neb_cfg:-/}:${neb_state:-/}" in /*:/*) ;; *) printf 'Configuration and state paths must be absolute.\n' >&2; exit 2;; esac
 python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) and sys.platform == "linux" else "Linux with Python 3.10+ is required.")'
