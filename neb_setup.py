@@ -68,7 +68,10 @@ def file_digest(path):
 
 
 def download(asset, dest):
-    digest, remaining, expires = hashlib.sha256(), asset.size, time.monotonic() + 180
+    # Large pinned CUDA packages need enough time on slower links.
+    # The opener still bounds idle reads, and size and SHA-256 are mandatory.
+    budget = max(180, asset.size / (64 * 1024))
+    digest, remaining, expires = hashlib.sha256(), asset.size, time.monotonic() + budget
     partial = dest.with_name("." + dest.name + ".partial")
     try:
         with opener(asset.url) as source, partial.open("xb") as target:

@@ -36,3 +36,13 @@ class SetupTests(unittest.TestCase):
         with patch.object(setup, "opener", return_value=io.BytesIO(b"official")):
             setup.download(a, dest)
         self.assertEqual(dest.read_bytes(), b"official")
+
+    def test_large_verified_package_can_take_longer_than_the_small_file_budget(self):
+        body = b"c" * (12 * 1024 * 1024)
+        asset = setup.Asset("https://github.com/official/large", sha256(body).hexdigest(), len(body))
+        dest = self.path / "large"
+        times = iter([0, *([181] * 12)])
+        with (patch.object(setup, "opener", return_value=io.BytesIO(body)),
+              patch.object(setup.time, "monotonic", side_effect=lambda: next(times))):
+            setup.download(asset, dest)
+        self.assertEqual(setup.file_digest(dest), asset.digest)
