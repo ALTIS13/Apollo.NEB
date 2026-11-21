@@ -69,7 +69,7 @@ Windows-сборка управляет этими воркерами. Лока�
 --service.
 
 ~~~sh
-apollo-neb upgrade --apply --version v0.9.0-rc.1
+apollo-neb upgrade --apply --version v0.9.0
 ~~~
 
 После обновления запустите панель и проверьте профиль. На Windows остановите
