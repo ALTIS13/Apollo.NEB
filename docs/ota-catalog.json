@@ -1,5 +1,43 @@
 [
   {
+    "tag_name": "v0.9.0",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-11-21T22:04:23Z",
+    "html_url": "https://github.com/ALTIS13/Apollo.NEB/releases/tag/v0.9.0",
+    "body": "# Apollo.NEB 0.9.0\n\nСтабильный выпуск для основного канала обновлений. В панели видны установленная\nверсия, совместимый пакет и его SHA-256.\n\n| Пакет | Для чего |\n| --- | --- |\n| Linux Portable | Локальная добыча NEB Mainnet |\n| Linux x64, ядра 6.6 и 6.12 | Отдельные архивы для этих веток ядра |\n| Windows x64 | Управление Linux-нодами, Python 3.10+ x64 |\n\nLinux поддерживает AMD/OpenCL, NVIDIA/CUDA и совместимые майнеры с ручной\nнастройкой. В WSL2 панель определяет NVIDIA через драйвер Windows и использует\nдоступный датчик температуры для защиты воркера.\n\n**DevFee — 1,1% активного времени добычи.** Состояние видно в панели.\n\n[Установка, подключение нод и откат](https://github.com/ALTIS13/Apollo.NEB/blob/main/docs/onboarding-and-distribution.md)\n",
+    "assets": [
+      {
+        "name": "apollo-neb-0.9.0-linux-x64-kernel-6.12.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.0/apollo-neb-0.9.0-linux-x64-kernel-6.12.tar.gz",
+        "digest": "sha256:0df472bc25ec70b3d2dfade01365420aecd8a0e0a49dcc838510e4b7bd20b8ec",
+        "size": 118729,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-0.9.0-linux-x64-kernel-6.6.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.0/apollo-neb-0.9.0-linux-x64-kernel-6.6.tar.gz",
+        "digest": "sha256:2c16d8b2f7ab21a23ede7803a1ab7739a9eb4524c0aa20b976e9e5cd00771b76",
+        "size": 118725,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-0.9.0-linux.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.0/apollo-neb-0.9.0-linux.tar.gz",
+        "digest": "sha256:6f25ef877f3511f7773bb93cbdec105ae0ff5935c02e053492769bf20b53163c",
+        "size": 118659,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-0.9.0-windows-x64.zip",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.0/apollo-neb-0.9.0-windows-x64.zip",
+        "digest": "sha256:59d48642b24cd7e6b63d763d680d07c5b0646414863f90d45270adba80ddf8ae",
+        "size": 130974,
+        "state": "uploaded"
+      }
+    ]
+  },
+  {
     "tag_name": "v0.9.0-rc.1",
     "draft": false,
     "prerelease": true,
