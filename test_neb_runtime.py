@@ -185,8 +185,8 @@ class RuntimeTests(unittest.TestCase):
         card = {"device": GPU, "vendor": "amd", "edge": 55, "hot": 60, "hbm": None, "watts": None}
         manager = self.manager(device=GPU, args=["{device}"])
         with patch.object(runtime, "discover_devices", return_value=[card]):
-            manager.snapshot({"hbm_limit": 95})
-            with self.assertRaises(ValueError):
+            manager.snapshot({"hbm_limit": 85})
+            with self.assertRaisesRegex(ValueError, "Memory temperature is unavailable"):
                 manager.start("test", PROFILE)
 
 
