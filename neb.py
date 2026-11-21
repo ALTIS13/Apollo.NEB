@@ -2,16 +2,20 @@
 """Apollo.NEB local installer configuration and supervisor entrypoint."""
 import argparse
 import base64
+import hashlib
 import getpass
+import logging
 import json
 import os
 import secrets
 import signal
 import stat
+import sqlite3
 import subprocess
 import sys
 import threading
 from pathlib import Path
+from contextlib import closing
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -19,8 +23,10 @@ sys.path.insert(0, str(HERE))
 import neb_app
 import neb_core as core
 import neb_runtime
-
-VERSION = "0.6.0"
+import neb_setup
+import neb_release
+import neb_wallet
+from neb_release import VERSION
 
 
 def private(path):
@@ -48,8 +54,36 @@ def settings_path(cfg):
 
 def configure(args):
     cfg, state = paths(args)
+    target = args.publish_current
+    if target is not None and (target.resolve() != target or HERE.parent != target/"lib"/"apollo-neb"
+                               or not HERE.name.startswith("release.")):
+        raise ValueError("Публикация допустима только из нового каталога установки.")
     with lock_state(private(state)):
         configure_locked(args, cfg, state)
+        if target is not None:
+            switch = HERE/".switch"
+            try:
+                switch.symlink_to(HERE.name)
+                switch.replace(HERE.parent/"current")
+            finally:
+                switch.unlink(missing_ok=True)
+
+
+def persisted_totp(login, path):
+    """Do not migrate the live login database while preparing new package files."""
+    if not path.is_file():
+        return bool(login.get("totp"))
+    uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri,uri=True,timeout=3)) as db:
+            fields = {row[1] for row in db.execute("PRAGMA table_info(auth)")}
+            if "totp_secret" in fields:
+                value = db.execute("SELECT totp_secret FROM auth WHERE id=1").fetchone()
+                if value is not None:
+                    return value[0] is not None
+    except sqlite3.Error:
+        raise ValueError("Не удалось прочитать текущую настройку входа. База не изменена.") from None
+    return bool(login.get("totp"))
 
 
 def configure_locked(args, cfg, state):
@@ -86,10 +120,11 @@ def configure_locked(args, cfg, state):
     login_path = cfg / "login.json"
     login = core.read(login_path, None)
     enrollment = None
-    if login is not None and args.totp and not login.get("totp"):
-        raise ValueError("Для включения TOTP в существующем профиле: apollo-neb password --totp.")
-    if origin and not (args.totp or (login and login.get("totp"))):
-        raise ValueError("Для внешнего HTTPS origin требуется TOTP (--totp).")
+    has_totp = persisted_totp(login,state/"auth.sqlite") if login is not None else args.totp
+    if login is not None and args.totp and not has_totp:
+        raise ValueError("Сначала включите 2FA в панели или выполните apollo-neb password --totp.")
+    if origin and not has_totp:
+        raise ValueError("Сначала включите 2FA. Для новой установки с внешним адресом используйте --totp.")
     if login is None:
         login, enrollment = prompt_login(args)
     private(cfg)
@@ -143,17 +178,9 @@ def rotate_password(args):
         raise ValueError("Сначала выполните configure.")
     with lock_state(private(state)):
         new, enrollment = prompt_login(args)
-        if not args.totp:
-            new["totp"] = old["totp"]
+        auth = core.Auth(old,state/"auth.sqlite")
+        auth.reset_after_password_change(enrollment)
         core.store(cfg / "login.json", new)
-        db = state / "auth.sqlite"
-        if db.exists():
-            import sqlite3
-            from contextlib import closing
-            with closing(sqlite3.connect(db, timeout=3)) as conn, conn:
-                conn.execute("DELETE FROM sessions")
-                if enrollment:
-                    conn.execute("UPDATE auth SET last_tick=-1 WHERE id=1")
         enroll(enrollment)
         print("Пароль обновлён. Прежние сессии отозваны.")
 
@@ -171,31 +198,39 @@ def supervised():
 
 
 def serve(args):
+    import neb_fleet
     cfg, state = paths(args)
     login = core.read(cfg / "login.json", None)
     settings = core.read(settings_path(cfg), None)
     if login is None or settings is None:
         raise ValueError("Сначала выполните ./install.sh или apollo-neb configure.")
-    if settings.get("origin") and not login.get("totp"):
-        raise ValueError("Внешний адрес допускается только с TOTP.")
     port = settings["port"]
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Укажите допустимый непривилегированный порт.")
     private(cfg)
     private(state)
     with lock_state(state):
+        auth = core.Auth(login, state / "auth.sqlite")
+        if settings.get("origin") and not auth.is_totp_enabled():
+            raise ValueError("Внешний адрес допускается только с TOTP.")
         workers = neb_runtime.validate_workers(core.read(cfg / "workers.json", []))
         runtime = neb_runtime.Manager(workers, state)
         support = settings.get("support")
         if core.support_config(support)["enabled"] and not supervised():
             print("Поддержка автора отключена вне управляемой службы systemd.", file=sys.stderr)
             support = None
-        service = neb_app.Service(cfg, state, runtime, core.read(cfg / "pools.json", core.DEFAULT_POOLS), support)
-        auth = core.Auth(login, state / "auth.sqlite")
+        service = neb_app.Service(cfg,state,runtime,core.read(cfg/"pools.json",core.DEFAULT_POOLS),support,
+                                  setup=neb_setup.Setup(state),wallets=neb_wallet.WalletStore(state),
+                                  releases=neb_release.Releases(),fleet=neb_fleet.Fleet(state/"fleet.sqlite"))
         server = neb_app.Server(("127.0.0.1", port), service, auth, HERE / "web", settings.get("origin"))
         service.poll()
         background = threading.Thread(target=service.loop, name="neb-monitor", daemon=True)
         background.start()
+        link = core.read(cfg/"fleet-link.json")
+        if isinstance(link,dict) and link.get("paired") is True:
+            follower = neb_fleet.Client(link["origin"],link["id"],link["key"],link_receipts(state,link),
+                                        allow_loopback=link.get("allow_loopback") is True)
+            threading.Thread(target=node_loop,args=(service,follower),daemon=True,name="neb-node").start()
 
         def stop(_signum, _frame):
             raise KeyboardInterrupt()
@@ -210,6 +245,51 @@ def serve(args):
             service.close()
             server.server_close()
             background.join(timeout=3)
+
+
+def node_loop(service, follower):
+    def execute(action, ids):
+        result = service.group(action,ids)
+        if not all(row["ok"] for row in result["results"]):
+            raise RuntimeError("Результат действия подтверждён не полностью.")
+    last_fault = -60.
+    while not service.stopping.is_set():
+        try:
+            follower.cycle(service.status()["workers"],execute)
+        except (ValueError,RuntimeError,OSError):
+            if time.monotonic() - last_fault >= 60:
+                logging.warning("Apollo.NEB could not update its remote node link.")
+                last_fault = time.monotonic()
+        service.stopping.wait(4)
+
+
+def link_receipts(state, link):
+    ident = hashlib.sha256(("\0".join(link[field] for field in ("origin","id","key"))).encode()).hexdigest()[:24]
+    return state/f"node-commands-{ident}.sqlite"
+
+
+def pair_node(args):
+    import neb_fleet
+    cfg, state = paths(args)
+    private(cfg)
+    private(state)
+    file = cfg/"fleet-link.json"
+    if core.read(cfg/"login.json") is None:
+        raise ValueError("Сначала установите и настройте эту панель.")
+    with lock_state(state):
+        previous = core.read(file,{})
+        if previous and (previous["origin"] != args.origin or previous["id"] != args.id):
+            raise ValueError("Сначала отзовите существующее подключение и выполните apollo-neb node-unpair.")
+        if previous.get("paired") is True:
+            raise ValueError("Этот узел уже подключён.")
+        new = previous or {"origin":args.origin,"id":args.id,"key":secrets.token_urlsafe(32),
+                           "allow_loopback":args.allow_loopback,"paired":False}
+        client = neb_fleet.Client(new["origin"],new["id"],new["key"],link_receipts(state,new),
+                                  allow_loopback=new["allow_loopback"])
+        core.store(file,new)
+        client.join(getpass.getpass("Одноразовый код из центральной панели: ").strip())
+        core.store(file,{**new,"paired":True})
+        print("Нода подключена. Запустите эту панель, чтобы отправлять статус.")
 
 
 def main():
@@ -232,11 +312,20 @@ def main():
     command.add_argument("--disable-support", action="store_true", help="выключить поддержку автора")
     command.add_argument("--totp", action="store_true", help="на первой установке подключить двухфакторный вход")
     command.add_argument("--password-stdin", action="store_true", help="для автоматизации: прочитать пароль из stdin, не передавать в аргументах")
+    command.add_argument("--publish-current",type=Path,help=argparse.SUPPRESS)
     command = sub.add_parser("password", help="сменить пароль в остановленной панели и отозвать сессии")
     command.add_argument("--totp", action="store_true", help="выдать новый ключ TOTP")
     command.add_argument("--password-stdin", action="store_true")
     sub.add_parser("devices", help="показать обнаруженные PCI GPU и доступность показаний")
     sub.add_parser("serve", help="запустить локальную панель без автоматического запуска воркеров")
+    command = sub.add_parser("upgrade",help="проверить официальный релиз; установка только с --apply")
+    command.add_argument("--apply",action="store_true")
+    command.add_argument("--service",action="store_true",help="запустить пользовательскую службу после установки")
+    command = sub.add_parser("node-pair",help="подключить этот узел к центральной панели")
+    command.add_argument("--origin",required=True,help="HTTPS адрес центральной панели")
+    command.add_argument("--id",required=True,help="идентификатор из центральной панели")
+    command.add_argument("--allow-loopback",action="store_true",help="разрешить HTTP только в локальном SSH-туннеле")
+    sub.add_parser("node-unpair",help="отключить исходящее соединение этой панели; сначала отзовите узел на центральной")
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -248,9 +337,24 @@ def main():
             rotate_password(args)
         elif args.action == "devices":
             print(json.dumps(neb_runtime.discover_devices(), ensure_ascii=False, indent=2))
+        elif args.action == "node-pair":
+            pair_node(args)
+        elif args.action == "node-unpair":
+            cfg, state = paths(args)
+            with lock_state(private(state)):
+                (cfg/"fleet-link.json").unlink(missing_ok=True)
+            print("Локальная привязка снята.")
+        elif args.action == "upgrade":
+            cfg, state = paths(args)
+            if args.apply:
+                with lock_state(private(state)):
+                    pass
+            parent = HERE.parent
+            prefix = parent.parent.parent if parent.name == "apollo-neb" and parent.parent.name == "lib" else Path.home()/".local"
+            neb_release.upgrade(cfg,state,prefix=prefix,apply=args.apply,service=args.service)
         else:
             serve(args)
-    except (ValueError, RuntimeError, OSError, EOFError, KeyboardInterrupt) as exc:
+    except (ValueError, RuntimeError, OSError, EOFError, KeyboardInterrupt, subprocess.SubprocessError) as exc:
         print(f"Apollo.NEB: {exc or 'отменено'}", file=sys.stderr)
         return 1
     return 0

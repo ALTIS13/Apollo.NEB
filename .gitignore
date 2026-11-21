@@ -11,6 +11,9 @@ workers.json
 pools.json
 settings.json
 support-time.json
+fleet-link.json
+wallet.neb
+wallets/
 *.pem
 *.key
 *.log

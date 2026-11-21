@@ -6,7 +6,9 @@
   <meta name="color-scheme" content="dark">
   <meta name="description" content="Локальная панель майнинга NEB для Linux">
   <title>Apollo.NEB — панель майнинга</title>
+  <link rel="icon" type="image/svg+xml" href="/brand.svg">
   <link rel="stylesheet" href="/ui.css">
+  <script src="/qr.js" defer></script>
   <script src="/ui.js" defer></script>
 </head>
 <body>
@@ -44,7 +46,10 @@
       <p>Введите пароль администратора, заданный при установке на Linux.</p>
       <form id="login-form">
         <label>Пароль<input id="password" type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>
-        <label>Код из приложения <span class="subline">Только если включена двухфакторная защита</span><input id="login-code" name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label>
+        <label id="login-code-row" for="login-code" hidden>Код 2FA или резервный код
+          <span id="login-code-hint" class="subline">Код из приложения или один сохранённый резервный код</span>
+          <input id="login-code" name="code" autocomplete="one-time-code" maxlength="80" spellcheck="false" autocapitalize="none" aria-describedby="login-code-hint">
+        </label>
         <button class="primary" type="submit">Войти</button>
         <p id="login-message" class="form-message" role="status"></p>
       </form>
@@ -55,11 +60,16 @@
           <p class="eyebrow">КОНСОЛЬ МАЙНИНГА <span aria-hidden="true">/</span> LINUX</p>
           <h1 id="page-title">Обзор фермы</h1>
         </div>
-        <button type="button" id="profile-open" class="profile-button"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>Профиль пула</button>
+        <div class="page-actions">
+          <button type="button" data-totp><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Защита входа</button>
+          <button type="button" data-wallets>Кошельки</button>
+          <button type="button" id="profile-open" class="profile-button"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>Профиль пула</button>
+        </div>
       </div>
       <nav class="views" aria-label="Разделы панели">
         <button type="button" data-view="overview" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#i-pulse"/></svg>Обзор</button>
         <button type="button" data-view="workers"><svg class="icon" aria-hidden="true"><use href="#i-chip"/></svg>Воркеры</button>
+        <button type="button" data-view="nodes"><svg class="icon" aria-hidden="true"><use href="#i-terminal"/></svg>Ноды</button>
         <button type="button" data-view="events"><svg class="icon" aria-hidden="true"><use href="#i-journal"/></svg>События</button>
       </nav>
       <p id="notice" class="notice" role="status" hidden></p>
@@ -74,8 +84,9 @@
             </div>
           </div>
           <ol class="steps">
-            <li><span class="step-number">01</span><div><h3 id="step-profile-title">Задайте профиль пула</h3><p>Нужен публичный адрес NEB для выплат. Приватный ключ или seed-фраза не нужны.</p></div><button type="button" class="primary" data-profile><span id="step-profile-action">Настроить профиль</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button></li>
-            <li><span class="step-number">02</span><div><h3 id="step-workers-title">Добавьте воркеры</h3><p>Выберите устройства и адаптеры в конфигурации Linux, затем запустите воркер на вкладке «Воркеры».</p></div><button type="button" data-setup>Настройка на Linux</button></li>
+            <li><span class="step-number">01</span><div><h3 id="step-auth-title">Защитите вход с помощью 2FA</h3><p>Необязательный шаг для локальной панели: подтвердите пароль и подключите приложение-аутентификатор.</p></div><button type="button" data-totp aria-label="Настройка 2FA">Настройка 2FA</button></li>
+            <li><span class="step-number">02</span><div><h3 id="step-profile-title">Задайте профиль пула</h3><p>Укажите существующий публичный адрес NEB или создайте кошелёк в панели. Приватный ключ и seed-фраза не нужны.</p></div><button type="button" class="primary" data-profile><span id="step-profile-action">Настроить профиль</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button></li>
+            <li><span class="step-number">03</span><div><h3 id="step-workers-title">Добавьте воркеры</h3><p>Выберите обнаруженные GPU. Добавление воркеров не запускает майнинг.</p></div><button type="button" data-discovery>Найти устройства</button></li>
           </ol>
           <p id="setup-support" class="support-note"></p>
         </section>
@@ -116,13 +127,47 @@
               <p id="support-recipient" class="mono"></p>
               <p id="support-active" class="muted"></p>
             </section>
+            <section class="surface release" aria-labelledby="release-title">
+              <div class="panel-head"><div><h2 id="release-title">Релизы</h2><p>Обновления устанавливаются вручную.</p></div></div>
+              <p id="release-status" class="subline" role="status">Проверка выполняется по запросу.</p>
+              <div class="panel-actions"><button type="button" id="release-check">Проверить релиз</button><a id="release-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Открыть страницу релиза</a></div>
+              <p id="release-guide" class="subline" hidden>Остановите панель и выполните в терминале <code>apollo-neb upgrade --apply</code>. Флаг <code>--service</code> перезапустит установленную пользовательскую службу.</p>
+            </section>
           </div>
         </div>
       </section>
       <section id="workers" hidden>
-        <div class="section-header"><p id="worker-summary">Нет настроенных воркеров.</p><button type="button" data-limits><svg class="icon" aria-hidden="true"><use href="#i-temp"/></svg>Температурные пределы</button></div>
-        <div class="surface empty" id="workers-empty" hidden><h2>Воркеры ещё не добавлены</h2><p>Укажите устройства и адаптеры майнера в конфигурации на Linux.</p><button type="button" class="primary" data-setup>Настройка на Linux</button></div>
+        <div class="section-header"><p id="worker-summary">Нет настроенных воркеров.</p><div class="page-actions"><button type="button" data-discovery>Добавить GPU</button><button type="button" data-limits><svg class="icon" aria-hidden="true"><use href="#i-temp"/></svg>Температурные пределы</button></div></div>
+        <div class="surface empty" id="workers-empty" hidden><h2>Воркеры ещё не добавлены</h2><p>Найдите GPU на сервере Linux или добавьте конфигурацию вручную.</p><button type="button" class="primary" data-discovery>Найти устройства</button></div>
+        <div class="surface group-toolbar" id="group-toolbar" hidden>
+          <div class="panel-actions">
+            <button type="button" id="group-select">Выбрать все</button><button type="button" id="group-clear">Снять выбор</button>
+            <span id="group-count" class="mono muted" role="status"></span>
+          </div>
+          <div class="panel-actions"><button type="button" class="primary" id="group-start" disabled>Запустить выбранные</button><button type="button" class="stop-button" id="group-stop" disabled>Остановить выбранные</button></div>
+          <p id="group-message" class="subline" role="status"></p><ul id="group-results" class="result-list" hidden></ul>
+        </div>
         <div id="worker-grid" class="workers-grid" aria-label="Воркеры"></div>
+      </section>
+      <section id="nodes" hidden>
+        <section class="surface node-join" aria-labelledby="node-join-title">
+          <div class="panel-head"><div><h2 id="node-join-title">Подключить ноду</h2><p>Нода сама подключается к этой панели и передаёт только состояние воркеров. Пара не включает майнинг автоматически.</p></div><button type="button" id="fleet-refresh">Обновить</button></div>
+          <p id="fleet-status" class="subline" role="status">Проверяем список нод…</p>
+          <form id="fleet-enroll" hidden>
+            <label>Название ноды<input id="fleet-label" maxlength="60" required autocomplete="off"></label>
+            <button type="submit" class="primary">Создать код подключения</button>
+          </form>
+          <div id="fleet-invite" class="inner-form" hidden>
+            <h3>Одноразовое подключение</h3>
+            <p id="fleet-invite-expiry" class="subline"></p>
+            <dl class="node-invite-values"><dt>ID ноды</dt><dd id="fleet-invite-id"></dd><dt>Код подключения</dt><dd id="fleet-invite-code"></dd></dl>
+            <div class="command" id="fleet-command-copy"><code id="fleet-invite-command"></code><button type="button" id="fleet-copy" class="quiet" aria-label="Копировать команду подключения"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div>
+            <p id="fleet-invite-hint" class="subline"></p>
+            <button type="button" id="fleet-hide-invite" class="quiet">Скрыть код</button>
+          </div>
+          <p id="fleet-message" class="form-message" role="status"></p>
+        </section>
+        <div id="node-list" class="nodes-list"></div>
       </section>
       <section id="events" hidden>
         <div class="surface">
@@ -134,6 +179,83 @@
     </div>
   </main>
   <footer class="frame foot"><span>Apollo.NEB</span><span>Локальная панель · время браузера</span></footer>
+  <dialog id="totp-dialog" aria-labelledby="totp-title">
+    <div class="dialog-head"><h2 id="totp-title">Защита входа</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p id="totp-status" role="status"></p>
+    <form id="totp-begin" hidden>
+      <label>Пароль панели<input id="totp-password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+      <button type="submit" class="primary">Подготовить 2FA</button>
+    </form>
+    <div id="totp-enroll" hidden>
+      <p>Отсканируйте QR-код приложением-аутентификатором или введите секрет вручную. Не пересылайте его другим людям.</p>
+      <div id="totp-qr-wrap" class="qr-wrap" hidden><svg id="totp-qr" role="img" aria-label="QR-код для приложения-аутентификатора" xmlns="http://www.w3.org/2000/svg"></svg></div>
+      <div class="command"><code id="totp-secret"></code><button type="button" id="totp-copy" class="quiet" aria-label="Копировать секрет"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div>
+      <form id="totp-confirm">
+        <label>Код из приложения<input id="totp-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
+        <button type="submit" class="primary">Включить 2FA</button>
+      </form>
+      <button type="button" id="totp-restart" class="quiet">Начать заново</button>
+    </div>
+    <div id="totp-recovery" hidden>
+      <p>Сохраните резервные коды в безопасном месте. Каждый подходит для одного входа. Панель больше не покажет этот список.</p>
+      <ul id="totp-codes" class="recovery-codes"></ul>
+      <button type="button" id="totp-recovery-copy">Скопировать резервные коды</button>
+    </div>
+    <form id="totp-disable" class="inner-form" hidden>
+      <h3>Отключить 2FA для локального входа</h3>
+      <p class="subline">После отключения вход защитит только пароль. Все резервные коды станут недействительными.</p>
+      <label>Пароль панели<input id="totp-disable-password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+      <label>Код 2FA или резервный код<input id="totp-disable-code" required maxlength="80" autocomplete="one-time-code"></label>
+      <button type="submit" class="stop-button">Отключить 2FA</button>
+    </form>
+    <p id="totp-message" class="form-message" role="status"></p>
+  </dialog>
+  <dialog id="wallets-dialog" aria-labelledby="wallets-title">
+    <div class="dialog-head"><h2 id="wallets-title">Кошельки</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p>Для выплат используется только публичный адрес. Пароль кошелька отличается от пароля панели; не храните их вместе.</p>
+    <p id="wallets-status" role="status"></p>
+    <div class="panel-actions dialog-actions">
+      <button type="button" id="wallets-refresh">Обновить</button>
+      <button type="button" id="wallets-install" hidden>Загрузить модуль кошелька</button>
+      <button type="button" class="primary" id="wallet-new" hidden>Новый кошелёк</button>
+    </div>
+    <ul id="wallets-list" class="setup-rows"></ul>
+    <form id="wallet-create" class="inner-form" hidden>
+      <h3>Создание кошелька</h3>
+      <label>Название кошелька<input id="wallet-label" required maxlength="48" autocomplete="off"></label>
+      <label>Пароль кошелька<input id="wallet-create-password" type="password" required minlength="14" maxlength="128" autocomplete="new-password"></label>
+      <p class="subline">От 14 символов. Пароль нужен для доступа к файлу кошелька и не восстанавливается панелью.</p>
+      <label>Повторите пароль кошелька<input id="wallet-create-repeat" type="password" required minlength="14" maxlength="128" autocomplete="new-password"></label>
+      <div class="panel-actions"><button type="submit" class="primary">Создать кошелёк</button><button type="button" data-wallet-cancel>Отмена</button></div>
+    </form>
+    <form id="wallet-export" class="inner-form" hidden>
+      <h3>Зашифрованная резервная копия</h3>
+      <p id="wallet-export-target" class="subline"></p>
+      <label>Пароль для резервной копии<input id="wallet-export-password" type="password" required maxlength="128" autocomplete="off"></label>
+      <p class="subline">Введите пароль этого кошелька. Копия останется зашифрованной тем же паролем.</p>
+      <div class="panel-actions"><button type="submit" class="primary">Сохранить .neb</button><button type="button" data-wallet-cancel>Отмена</button></div>
+    </form>
+    <p id="wallets-message" class="form-message" role="status"></p>
+  </dialog>
+  <dialog id="discovery-dialog" aria-labelledby="discovery-title">
+    <div class="dialog-head"><h2 id="discovery-title">Устройства Linux</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p>Панель читает устройства и датчики на сервере. Майнер загружается только по вашему запросу.</p>
+    <p id="discovery-status" role="status"></p>
+    <div class="panel-actions dialog-actions"><button type="button" id="discovery-refresh">Обновить устройства</button><button type="button" id="discovery-manual">Настройка на Linux</button></div>
+    <h3 class="dialog-section-title">Майнеры</h3>
+    <ul id="miner-list" class="setup-rows"></ul>
+    <form id="discovery-add">
+      <h3>Доступные GPU</h3>
+      <div id="device-list" class="setup-rows"></div>
+      <button type="submit" class="primary" id="discovery-save" disabled>Добавить выбранные GPU</button>
+    </form>
+    <p id="discovery-message" class="form-message" role="status"></p>
+  </dialog>
+  <dialog id="fleet-revoke-dialog" aria-labelledby="fleet-revoke-title">
+    <div class="dialog-head"><h2 id="fleet-revoke-title">Отозвать доступ ноды</h2><button type="button" class="quiet" data-close>Отмена</button></div>
+    <p id="fleet-revoke-target"></p><p>Это закрывает доступ к панели, но не останавливает майнер на ноде.</p>
+    <form id="fleet-revoke-form"><button type="submit" class="stop-button">Отозвать доступ</button></form>
+  </dialog>
   <dialog id="profile-dialog" aria-labelledby="profile-title">
     <div class="dialog-head"><h2 id="profile-title">Профиль пула</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <p>Пул получает только публичный адрес NEB. Не вставляйте приватный ключ или seed-фразу.</p>
@@ -175,6 +297,7 @@ apollo-neb configure --help</code><button type="button" class="quiet" data-copy 
   <template id="worker-template">
     <article class="surface worker-card">
       <div class="worker-head"><div><h2 data-field="label"></h2><p data-field="device" class="mono"></p></div><span data-field="state" class="state"></span></div>
+      <label class="check worker-select"><input type="checkbox" data-worker-select>Выбрать воркер</label>
       <p data-field="rate" class="worker-rate"></p>
       <dl class="worker-sensors">
         <div><dt>Ядро</dt><dd data-field="edge"></dd></div>

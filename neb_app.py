@@ -12,13 +12,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import neb_core as core
+from neb_fleet import FleetAuthError
 from neb_history import Archive
 
 HERE = Path(__file__).resolve().parent
 
 
 class Service:
-    def __init__(self, config, state, runtime, pools, support):
+    def __init__(self, config, state, runtime, pools, support, *, setup=None, wallets=None, releases=None, fleet=None):
         self.config, self.runtime = config, runtime
         self.lock, self.stopping = threading.RLock(), threading.Event()
         self.archive = Archive(state / "history.sqlite")
@@ -31,6 +32,36 @@ class Service:
         self.last, self.rows = 0, []
         self.suspended_support = set()
         self.events = []
+        self.setup, self.wallets, self.releases, self.fleet = setup, wallets, releases, fleet
+
+    def register(self, ids):
+        if not self.setup:
+            raise ValueError("Настройка устройств недоступна.")
+        with self.lock:
+            current = core.read(self.config / "workers.json", [])
+            new = self.setup.worker_configs(ids,current)
+            self.runtime.register(new, lambda rows: core.store(self.config/"workers.json", rows))
+            self.rows = self.runtime.snapshot(self.limits)
+            return {"ids":[r["id"] for r in new]}
+
+    def group(self, action, ids):
+        if action not in ("start","stop") or not isinstance(ids,list) or not 1 <= len(ids) <= 24 or any(
+                not isinstance(i,str) for i in ids) or len(set(ids)) != len(ids):
+            raise ValueError("Выберите от 1 до 24 разных воркеров.")
+        with self.lock:
+            known = {row["id"] for row in self.rows}
+        if set(ids) - known:
+            raise ValueError("Один из воркеров не настроен.")
+        results = []
+        for id_ in ids:
+            try:
+                self.change(action,{"id":id_})
+                results.append({"id":id_,"ok":True})
+            except (ValueError,RuntimeError) as error:
+                results.append({"id":id_,"ok":False,"message":str(error)})
+            except (OSError,sqlite3.Error):
+                results.append({"id":id_,"ok":False,"message":"Результат не подтверждён. Проверьте состояние."})
+        return {"results":results}
 
     def add_event(self, kind, worker, detail, status):
         self.events.append({"type": kind, "time": int(time.time()), "worker": worker,
@@ -206,8 +237,12 @@ class Server(ThreadingHTTPServer):
         self.assets = {}
         for route, file, mime in (("/", "index.html", "text/html; charset=utf-8"),
                                   ("/ui.css", "ui.css", "text/css; charset=utf-8"),
-                                  ("/ui.js", "ui.js", "text/javascript; charset=utf-8")):
-            self.assets[route] = ((web_dir / file).read_bytes(), mime)
+                                  ("/ui.js", "ui.js", "text/javascript; charset=utf-8"),
+                                  ("/brand.svg", "brand.svg", "image/svg+xml"),
+                                  ("/favicon.ico", "brand.svg", "image/svg+xml"),
+                                  ("/qr.js", "qr.js", "text/javascript; charset=utf-8")):
+            if route in ("/","/ui.css","/ui.js") or (web_dir / file).is_file():
+                self.assets[route] = ((web_dir / file).read_bytes(), mime)
         super().__init__(address, Handler)
         host = f"127.0.0.1:{self.server_port}"
         self.origins = {host: "http://" + host}
@@ -287,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == "/favicon.ico":
             return self.respond(204, b"")
         try:
+            if path.path == "/api/auth/info":
+                return self.respond(200, {"totp": self.server.auth.is_totp_enabled()})
             if not self.server.auth.valid(self.token()):
                 return self.fail(401, "Войдите в панель.")
             service = self.server.service
@@ -294,6 +331,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, service.status())
             if path.path == "/api/events":
                 return self.respond(200, {"events": service.archive.events()})
+            if path.path == "/api/setup" and service.setup:
+                return self.respond(200, service.setup.status(len(service.status()["workers"])))
+            if path.path == "/api/wallets" and service.wallets:
+                return self.respond(200, service.wallets.status())
+            if path.path == "/api/releases" and service.releases:
+                return self.respond(200, service.releases.status())
+            if path.path == "/api/fleet" and service.fleet:
+                return self.respond(200, service.fleet.list())
             if path.path == "/api/history":
                 selected = parse_qs(path.query, max_num_fields=2).get("range", ["30m"])[-1]
                 return self.respond(200, {**service.archive.history(selected), "limits": service.status()["limits"]})
@@ -305,20 +350,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         origin = self.origin()
-        if origin is None or self.headers.get_all("Origin", []) != [origin]:
+        is_node = self.path in ("/api/node/pair","/api/node/poll")
+        if origin is None or (self.headers.get_all("Origin", []) != ([] if is_node else [origin])):
             return self.fail(403, "Запрос пришёл не с адреса панели.")
+        max_bytes = 65536 if is_node else 4096
         try:
             lengths = self.headers.get_all("Content-Length", [])
-            if (len(lengths) != 1 or not lengths[0].isdecimal() or not 1 <= int(lengths[0]) <= 4096
+            if (len(lengths) != 1 or not lengths[0].isdecimal() or not 1 <= int(lengths[0]) <= max_bytes
                     or self.headers.get("Transfer-Encoding") or self.headers.get_content_type() != "application/json"):
-                return self.fail(400, "Ожидается запрос JSON до 4 КиБ.")
+                return self.fail(400, "Нужен JSON допустимого размера.")
             body = json.loads(self.rfile.read(int(lengths[0])))
             if not isinstance(body, dict):
                 return self.fail(400, "Ожидается объект JSON.")
         except (ValueError, OSError):
             return self.fail(400, "Не удалось прочитать запрос.")
         auth, token = self.server.auth, self.token()
+        service = self.server.service
         try:
+            if is_node:
+                if not service.fleet or self.headers.get("Cookie"):
+                    return self.fail(403, "Подключение ноды недоступно.")
+                if self.path.endswith("/pair"):
+                    reply = service.fleet.pair(body.get("id"),body.get("code"),body.get("key"))
+                else:
+                    reply = service.fleet.poll(body.get("id"),body.get("key"),body.get("workers"),body.get("acks"))
+                return self.respond(200,reply)
             if self.path == "/api/login":
                 try:
                     token = auth.enter(body.get("password"), body.get("code"))
@@ -330,11 +386,42 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/logout":
                 auth.revoke(token)
                 return self.respond(200, {"ok": True}, cookie=self.cookie("", 0))
+            if self.path == "/api/auth/totp/begin":
+                return self.respond(200, auth.begin_enrollment(token,body.get("password")))
+            if self.path == "/api/auth/totp/confirm":
+                fresh,codes = auth.confirm_enrollment(token,body.get("code"))
+                return self.respond(200, {"ok":True,"recovery_codes":codes}, cookie=self.cookie(fresh,core.SESSION_SECONDS))
+            if self.path == "/api/auth/totp/disable":
+                if self.server.public_origin:
+                    raise ValueError("При внешнем HTTPS адресе двухфакторную защиту отключить нельзя.")
+                fresh = auth.disable_enrollment(token,body.get("password"),body.get("code"))
+                return self.respond(200, {"ok":True}, cookie=self.cookie(fresh,core.SESSION_SECONDS))
+            if self.path in ("/api/group/start","/api/group/stop"):
+                return self.respond(200,service.group(self.path.rsplit("/",1)[-1],body.get("ids")))
+            if self.path == "/api/setup/prepare" and service.setup:
+                return self.respond(200,service.setup.prepare(body.get("adapter")))
+            if self.path == "/api/setup/workers" and service.setup:
+                return self.respond(200,service.register(body.get("devices")))
+            if self.path == "/api/wallets/install" and service.wallets:
+                return self.respond(200,service.wallets.install())
+            if self.path == "/api/wallets/create" and service.wallets:
+                return self.respond(200,service.wallets.create(body.get("label"),body.get("password")))
+            if self.path == "/api/wallets/export" and service.wallets:
+                return self.respond(200,service.wallets.export(body.get("id"),body.get("password")))
+            if service.fleet:
+                if self.path == "/api/fleet/enroll":
+                    return self.respond(200,service.fleet.enroll(body.get("label")))
+                if self.path == "/api/fleet/revoke":
+                    return self.respond(200,service.fleet.revoke(body.get("id")))
+                if self.path == "/api/fleet/command":
+                    return self.respond(200,service.fleet.command(body.get("id"),body.get("action"),body.get("ids")))
             actions = {"/api/start": "start", "/api/stop": "stop", "/api/profile": "profile", "/api/limits": "limits"}
             if self.path not in actions:
                 return self.fail(404, "Действие не найдено.")
-            self.server.service.change(actions[self.path], body)
+            service.change(actions[self.path], body)
             self.respond(200, {"ok": True})
+        except FleetAuthError:
+            self.fail(401, "Код привязки или ключ ноды не принят.")
         except (RuntimeError, ValueError) as error:
             self.fail(409, str(error))
         except (OSError, sqlite3.Error):

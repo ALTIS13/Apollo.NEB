@@ -8,11 +8,10 @@ import re
 import secrets
 import sqlite3
 import tempfile
-import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 
 B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -185,59 +184,230 @@ def new_login(password, secret=None):
 
 
 class Auth:
+    ENROLLMENT_SECONDS = 300
+    LIMIT_ATTEMPTS = 5
+    ATTEMPT_SECONDS = 60
+    RECOVERY_COUNT = 8
+    BAD_CREDENTIALS = "Пароль или код не принят."
+    NO_PENDING = "Привязка недоступна. Начните её заново."
+
     def __init__(self, config, path):
-        self.config, self.path, self.lock, self.attempts = config, path, threading.Lock(), []
-        with closing(self.connect()) as db, db:
+        self.config, self.path = config, path
+        with self.write() as db:
             db.execute("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, expires INTEGER NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS auth (id INTEGER PRIMARY KEY CHECK (id=1), last_tick INTEGER NOT NULL)")
-            db.execute("INSERT OR IGNORE INTO auth VALUES (1,-1)")
+            db.execute("CREATE TABLE IF NOT EXISTS auth (id INTEGER PRIMARY KEY CHECK (id=1), "
+                       "last_tick INTEGER NOT NULL, totp_secret TEXT)")
+            legacy = not any(row[1] == "totp_secret" for row in db.execute("PRAGMA table_info(auth)"))
+            if legacy:
+                db.execute("ALTER TABLE auth ADD COLUMN totp_secret TEXT")
+            present = db.execute("SELECT 1 FROM auth WHERE id=1").fetchone()
+            if legacy or not present:
+                secret = self._validated_secret(config.get("totp"))
+                if present:
+                    db.execute("UPDATE auth SET totp_secret=? WHERE id=1", (secret,))
+                else:
+                    db.execute("INSERT INTO auth (id,last_tick,totp_secret) VALUES (1,-1,?)", (secret,))
+            db.execute("CREATE TABLE IF NOT EXISTS auth_pending (id INTEGER PRIMARY KEY CHECK (id=1), "
+                       "session TEXT NOT NULL REFERENCES sessions(token) ON DELETE CASCADE, "
+                       "secret TEXT NOT NULL, expires INTEGER NOT NULL, failures INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS auth_failures (attempted_at INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS auth_recovery (digest TEXT PRIMARY KEY)")
 
     def connect(self):
-        return sqlite3.connect(self.path, timeout=3)
+        db = sqlite3.connect(self.path, timeout=3)
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA secure_delete=ON")
+        return db
+
+    @contextmanager
+    def write(self):
+        # One database-wide serialization boundary even across Auth instances.
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
 
     @staticmethod
     def fingerprint(token):
         return hashlib.sha256(token.encode("ascii")).hexdigest()
 
-    def enter(self, password, code, *, now=None):
-        now = int(time.time() if now is None else now)
-        with self.lock:
-            self.attempts = [at for at in self.attempts if 0 <= now - at < 60]
-            if len(self.attempts) >= 5:
-                raise ValueError("Слишком много попыток, повторите через минуту.")
-            self.attempts.append(now)
-            error = ValueError("Пароль или код не принят.")
-            if not isinstance(password, str) or len(password) > 256:
-                raise error
+    @staticmethod
+    def _now(now):
+        return int(time.time() if now is None else now)
+
+    @staticmethod
+    def _valid_token(token):
+        return isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is not None
+
+    @staticmethod
+    def _validated_secret(secret):
+        if secret is not None and (not isinstance(secret, str) or not re.fullmatch(r"[A-Z2-7]{32}", secret)):
+            raise ValueError("Некорректный ключ TOTP.")
+        return secret
+
+    def _require_session(self, db, token, now):
+        if not self._valid_token(token) or not self._valid_session(db, token, now):
+            raise ValueError("Войдите в панель.")
+        return self.fingerprint(token)
+
+    def _valid_session(self, db, token, now):
+        return db.execute("SELECT 1 FROM sessions WHERE token=? AND expires>?",
+                          (self.fingerprint(token), now)).fetchone() is not None
+
+    def _check_limit(self, db, now):
+        db.execute("DELETE FROM auth_failures WHERE attempted_at<=?", (now - self.ATTEMPT_SECONDS,))
+        if db.execute("SELECT COUNT(*) FROM auth_failures").fetchone()[0] >= self.LIMIT_ATTEMPTS:
+            raise ValueError("Слишком много попыток, повторите через минуту.")
+
+    @staticmethod
+    def _failure(db, now):
+        db.execute("INSERT INTO auth_failures VALUES (?)", (now,))
+
+    def _password_ok(self, password):
+        if not isinstance(password, str) or not 12 <= len(password) <= 256:
+            return False
+        try:
             computed = password_hash(password, bytes.fromhex(self.config["salt"]))
-            if not hmac.compare_digest(computed, self.config["password_hash"]):
-                raise error
-            secret = self.config["totp"]
-            with closing(self.connect()) as db, db:
-                if secret is not None:
-                    if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
-                        raise error
-                    tick = next((t for t in (now // 30, now // 30 - 1)
-                                 if t >= 0 and hmac.compare_digest(totp(secret, t * 30), code)), None)
-                    if tick is None or not db.execute(
-                        "UPDATE auth SET last_tick=? WHERE id=1 AND last_tick<?", (tick, tick)
-                    ).rowcount:
-                        raise error
-                token = secrets.token_urlsafe(32)
-                db.execute("DELETE FROM sessions WHERE expires<=?", (now,))
-                db.execute("INSERT INTO sessions VALUES (?,?)", (self.fingerprint(token), now + SESSION_SECONDS))
-                self.attempts.clear()
-                return token
+        except UnicodeError:
+            return False
+        return hmac.compare_digest(computed, self.config["password_hash"])
+
+    @staticmethod
+    def _secret(db):
+        return db.execute("SELECT totp_secret FROM auth WHERE id=1").fetchone()[0]
+
+    @staticmethod
+    def _tick(secret, code, now):
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+            return None
+        return next((t for t in (now // 30, now // 30 - 1)
+                     if t >= 0 and hmac.compare_digest(totp(secret, t * 30), code)), None)
+
+    @staticmethod
+    def _recovery_digest(code):
+        if not isinstance(code, str) or len(code) > 64:
+            return None
+        code = code.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{8}){3}", code):
+            return None
+        return hashlib.sha256(b"Apollo.NEB recovery v1\0" + code.encode("ascii")).hexdigest()
+
+    def _factor_ok(self, db, secret, code, now):
+        tick = self._tick(secret, code, now)
+        if tick is not None:
+            return db.execute("UPDATE auth SET last_tick=? WHERE id=1 AND last_tick<?", (tick, tick)).rowcount == 1
+        digest = self._recovery_digest(code)
+        return digest is not None and db.execute("DELETE FROM auth_recovery WHERE digest=?", (digest,)).rowcount == 1
+
+    def _session(self, db, now, *, rotate=False):
+        token = secrets.token_urlsafe(32)
+        if rotate:
+            db.execute("DELETE FROM sessions")
+        else:
+            db.execute("DELETE FROM sessions WHERE expires<=?", (now,))
+        db.execute("INSERT INTO sessions VALUES (?,?)", (self.fingerprint(token), now + SESSION_SECONDS))
+        db.execute("DELETE FROM auth_failures")
+        return token
+
+    def is_totp_enabled(self):
+        with closing(self.connect()) as db:
+            return self._secret(db) is not None
+
+    def enter(self, password, code, *, now=None):
+        now = self._now(now)
+        with self.write() as db:
+            self._check_limit(db, now)
+            secret = self._secret(db)
+            if self._password_ok(password) and (secret is None or self._factor_ok(db, secret, code, now)):
+                return self._session(db, now)
+            self._failure(db, now)
+        raise ValueError(self.BAD_CREDENTIALS)
+
+    def begin_enrollment(self, token, password, *, now=None):
+        now = self._now(now)
+        with self.write() as db:
+            session = self._require_session(db, token, now)
+            if self._secret(db) is not None:
+                raise ValueError("TOTP уже подключён.")
+            self._check_limit(db, now)
+            if self._password_ok(password):
+                secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii")
+                expires = min(now + self.ENROLLMENT_SECONDS, db.execute(
+                    "SELECT expires FROM sessions WHERE token=?", (session,)).fetchone()[0])
+                db.execute("DELETE FROM auth_pending")
+                db.execute("INSERT INTO auth_pending VALUES (1,?,?,?,0)", (session, secret, expires))
+                query = urlencode(dict(secret=secret, issuer="Apollo.NEB", algorithm="SHA1", digits=6, period=30))
+                return {"secret": secret, "uri": "otpauth://totp/Apollo.NEB:admin?" + query,
+                        "expires_in": expires - now}
+            self._failure(db, now)
+        raise ValueError(self.BAD_CREDENTIALS)
+
+    def confirm_enrollment(self, token, code, *, now=None):
+        now = self._now(now)
+        failure = self.NO_PENDING
+        with self.write() as db:
+            session = self._require_session(db, token, now)
+            db.execute("DELETE FROM auth_pending WHERE expires<=?", (now,))
+            pending = db.execute("SELECT secret, failures FROM auth_pending WHERE id=1 AND session=?", (session,)).fetchone()
+            if pending is not None and self._secret(db) is None:
+                self._check_limit(db, now)
+                secret, failures = pending
+                tick = self._tick(secret, code, now)
+                if tick is None:
+                    self._failure(db, now)
+                    if failures + 1 >= self.LIMIT_ATTEMPTS:
+                        db.execute("DELETE FROM auth_pending")
+                    else:
+                        db.execute("UPDATE auth_pending SET failures=failures+1 WHERE id=1")
+                    failure = self.BAD_CREDENTIALS
+                else:
+                    codes = []
+                    db.execute("DELETE FROM auth_recovery")
+                    for _ in range(self.RECOVERY_COUNT):
+                        value = secrets.token_hex(16)
+                        recovery = "-".join(value[i:i + 8] for i in range(0, 32, 8))
+                        db.execute("INSERT INTO auth_recovery VALUES (?)", (self._recovery_digest(recovery),))
+                        codes.append(recovery)
+                    db.execute("UPDATE auth SET totp_secret=?, last_tick=? WHERE id=1", (secret, tick))
+                    db.execute("DELETE FROM auth_pending")
+                    return self._session(db, now, rotate=True), codes
+        raise ValueError(failure)
+
+    def disable_enrollment(self, token, password, code, *, now=None):
+        now = self._now(now)
+        with self.write() as db:
+            self._require_session(db, token, now)
+            self._check_limit(db, now)
+            secret = self._secret(db)
+            if secret is None:
+                raise ValueError("TOTP не подключён.")
+            if self._password_ok(password) and self._factor_ok(db, secret, code, now):
+                db.execute("UPDATE auth SET totp_secret=NULL,last_tick=-1 WHERE id=1")
+                db.execute("DELETE FROM auth_pending")
+                db.execute("DELETE FROM auth_recovery")
+                return self._session(db, now, rotate=True)
+            self._failure(db, now)
+        raise ValueError(self.BAD_CREDENTIALS)
+
+    def reset_after_password_change(self, new_secret=None):
+        """Called only by the offline CLI while holding the state-directory lock."""
+        new_secret = self._validated_secret(new_secret)
+        with self.write() as db:
+            if new_secret is not None:
+                if self._secret(db) is not None:
+                    raise ValueError("TOTP уже подключён: смена пароля не заменяет второй фактор.")
+                db.execute("UPDATE auth SET totp_secret=?,last_tick=-1 WHERE id=1", (new_secret,))
+                db.execute("DELETE FROM auth_recovery")
+            db.execute("DELETE FROM sessions")
+            db.execute("DELETE FROM auth_pending")
+            db.execute("DELETE FROM auth_failures")
 
     def valid(self, token, *, now=None):
-        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        if not self._valid_token(token):
             return False
-        now = int(time.time() if now is None else now)
         with closing(self.connect()) as db:
-            return db.execute("SELECT 1 FROM sessions WHERE token=? AND expires>?",
-                              (self.fingerprint(token), now)).fetchone() is not None
+            return self._valid_session(db, token, self._now(now))
 
     def revoke(self, token):
-        if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-            with closing(self.connect()) as db, db:
+        if self._valid_token(token):
+            with self.write() as db:
                 db.execute("DELETE FROM sessions WHERE token=?", (self.fingerprint(token),))

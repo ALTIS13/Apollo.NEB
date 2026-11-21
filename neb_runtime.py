@@ -600,6 +600,19 @@ class Manager:
             raise Refusal("Unknown worker.")
         return self._workers[ident]
 
+    def register(self, rows, save):
+        """Add new groups without stopping, replacing, or retargeting live workers."""
+        with self._lock:
+            if self._closed:
+                raise Refusal("Worker manager is closed.")
+            merged = validate_workers([*self._workers.values(), *rows])
+            save(merged)
+            for item in merged:
+                ident = item["id"]
+                if ident not in self._workers:
+                    self._workers[ident] = item
+                    self._state[ident] = ("stopped", "Stopped.")
+
     def _exit_if_finished(self, ident):
         child = self._live.get(ident)
         if child and child.finished():
