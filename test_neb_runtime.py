@@ -48,6 +48,13 @@ class WorkerConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runtime._argv(worker, PROFILE, Path("/bin/true"), card, {})
 
+    def test_suprminer_startup_check_is_not_live_hashrate(self):
+        setup = b"[neb] GPU0 Kepler KEP1 startup CPU/GPU check passed; 71.691 MH/s"
+        self.assertEqual(runtime._metrics(setup, "suprminer"), {})
+        summary = b"[NEB COMBINED] Total: 71.000 MH/s | A:3 R:1"
+        self.assertEqual(runtime._metrics(summary, "suprminer"),
+                         {"rate_hs": 71_000_000.0, "accepted": 3, "rejected": 1})
+
     def test_wsl_nvidia_uses_dxg_and_requires_current_temperature(self):
         info = SimpleNamespace(st_mode=stat.S_IFCHR, st_dev=7, st_ino=32, st_rdev=4352)
         dxg = SimpleNamespace(lstat=lambda: info)

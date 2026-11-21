@@ -409,6 +409,7 @@ def _argv(worker, profile, binary, card, env):
 
 RATE = re.compile(rb"(?<![\d.])([\d]+(?:\.[\d]+)?)\s*([kKmMgGtT]?)H/s\b")
 SHARES = re.compile(rb"\baccepted:\s*(\d{1,16})/(\d{1,16})\b", re.IGNORECASE)
+NEB_COUNTERS = re.compile(rb"\[NEB COMBINED\]\s+Total:[^|]*\|\s*A:(\d{1,16})\s+R:(\d{1,16})\b")
 
 
 def _metrics(line, log_format):
@@ -428,14 +429,19 @@ def _metrics(line, log_format):
                 found[key] = data[key]
         return found
     if log_format == "suprminer":
+        if b"startup cpu/gpu check" in line.lower():
+            return {}
         found = {}
         rate, shares = RATE.search(line), SHARES.search(line)
+        counters = NEB_COUNTERS.search(line)
         if rate:
             multiplier = {b"": 1, b"k": 1e3, b"m": 1e6, b"g": 1e9, b"t": 1e12}[rate[2].lower()]
             value = _number(rate[1].decode(), 1e18 / multiplier)
             if value is not None:
                 found["rate_hs"] = value * multiplier
-        if shares and int(shares[2]) >= int(shares[1]):
+        if counters:
+            found.update(accepted=int(counters[1]), rejected=int(counters[2]))
+        elif shares and int(shares[2]) >= int(shares[1]):
             found.update(accepted=int(shares[1]), rejected=int(shares[2]) - int(shares[1]))
         return found
     return {}
