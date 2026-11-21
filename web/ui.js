@@ -74,7 +74,10 @@ const totp = {seq: 0, busy: false, timer: null, expiresAt: 0};
 const fleet = {generation: 0, loading: false, busy: false, fresh: false, nodes: null, key: "", selected: new Map(), revokeId: null, inviteTimer: null};
 const workerLog = {id: null, request: null, key: ""};
 const network = {data: null, request: null, error: ""};
-let releaseSeq = 0;
+const releases = {seq: 0, verifySeq: 0, pending: "", info: null, candidate: null, message: "", tone: "neutral"};
+const RELEASE_HOME = "https://github.com/ALTIS13/Apollo.NEB/releases";
+const RELEASE_CHANNELS = new Map([["stable", "Основной"], ["testing", "Тестовый"]]);
+const RELEASE_PLATFORMS = new Map([["linux", "Linux"], ["windows", "Windows x64"], ["unsupported", "Не поддерживается"]]);
 
 class ApiError extends Error {
   constructor(status, detail) {
@@ -217,19 +220,30 @@ function thermalTone(value, limit) {
   return value >= limit ? "bad" : value >= limit - 5 ? "warn" : "neutral";
 }
 
+function hasCapability(key) {
+  return state.status?.capabilities?.[key] !== false;
+}
+
 function renderStatus() {
   const {workers: rawWorkers, profile, limits, support} = state.status || {};
-  const workers = inList(rawWorkers);
+  const localWorkers = hasCapability("local_workers");
+  const workers = localWorkers ? inList(rawWorkers) : [];
+  $("controller-note").hidden = localWorkers;
+  for (const control of all("[data-discovery], [data-limits], [data-profile], #profile-open, [data-view='workers']")) {
+    control.hidden = !localWorkers;
+  }
+  for (const control of all("[data-wallets]")) control.hidden = !hasCapability("wallet_tools");
+  if (!localWorkers && state.view === "workers") setView("nodes");
   const active = workers.filter(isRunning);
   const devices = workers.filter(worker => worker.device);
-  text($("live-workers"), `${active.length} / ${workers.length}`);
+  text($("live-workers"), localWorkers ? `${active.length} / ${workers.length}` : "—");
   const liveRate = !active.length && workers.length
     && workers.every(worker => !["starting", "stopping", "unavailable"].includes(worker.state)) ? 0 : sum(active, "rate_hs");
   const livePower = sum(devices, "watts");
   showLiveReading($("live-rate"), rate(liveRate), liveRate);
   showLiveReading($("live-watts"), fmt(livePower, "Вт"), livePower);
   text($("live-shares"), `${n(sum(active, "accepted"), 0)} / ${n(sum(active, "rejected"), 0)}`);
-  $("first-run").hidden = Boolean(workers.length && profile?.wallet);
+  $("first-run").hidden = !localWorkers || Boolean(workers.length && profile?.wallet);
   text($("step-profile-title"), profile?.wallet ? "Профиль пула сохранён" : "Задайте профиль пула");
   text($("step-profile-action"), profile?.wallet ? "Изменить профиль" : "Настроить профиль");
   text($("step-workers-title"), workers.length ? "Воркеры добавлены" : "Добавьте воркеры");
@@ -264,7 +278,7 @@ function renderStatus() {
   }
   renderThermalSensors(devices, limits);
   text($("worker-summary"), workers.length ? `В работе: ${active.length} из ${workers.length}` : "Нет настроенных воркеров.");
-  $("workers-empty").hidden = Boolean(workers.length);
+  $("workers-empty").hidden = !localWorkers || Boolean(workers.length);
   workerCards(workers);
   renderGroup(workers);
   $("profile-open").disabled = !state.online;
@@ -565,6 +579,7 @@ async function refreshTimeline() {
 
 function setView(view, focus = false) {
   if (!Object.hasOwn(PAGES, view)) return;
+  if (view === "workers" && !hasCapability("local_workers")) view = "nodes";
   if (state.view === "nodes" && view !== "nodes") clearFleetInvite();
   state.view = view;
   for (const button of all("[data-view]")) {
@@ -949,12 +964,7 @@ function resetAuxiliary() {
   for (const id of ["wallets-list", "miner-list", "device-list", "group-results"]) $(id).replaceChildren();
   for (const id of ["wallets-message", "wallets-status", "discovery-message", "discovery-status", "wallet-export-target", "group-message"]) text($(id), "");
   $("group-results").hidden = true;
-  releaseSeq++;
-  $("release-check").disabled = false;
-  $("release-link").hidden = true;
-  $("release-guide").hidden = true;
-  $("release-link").removeAttribute("href");
-  text($("release-status"), "Проверка выполняется по запросу.");
+  resetReleases();
   clearFleet();
 }
 
@@ -1037,7 +1047,7 @@ async function loadWallets() {
 }
 
 function openWallets() {
-  if (!state.online || $("wallets-dialog").open) return;
+  if (!state.online || !hasCapability("wallet_tools") || $("wallets-dialog").open) return;
   $("wallets-dialog").showModal();
   loadWallets();
 }
@@ -1136,7 +1146,7 @@ function renderDiscovery() {
 }
 
 function openDiscovery() {
-  if (!state.online || $("discovery-dialog").open) return;
+  if (!state.online || !hasCapability("local_workers") || $("discovery-dialog").open) return;
   $("discovery-dialog").showModal();
   loadDiscovery();
 }
@@ -1182,38 +1192,170 @@ function discoveryMutation(path, body, waitMessage, successMessage) {
   return loadDiscovery(path, body, waitMessage, successMessage);
 }
 
-async function checkReleases() {
-  const seq = ++releaseSeq;
-  const btn = $("release-check"), link = $("release-link");
-  btn.disabled = true;
-  link.hidden = true;
-  $("release-guide").hidden = true;
-  link.removeAttribute("href");
-  text($("release-status"), "Проверяем релизы…");
+function releaseCandidate(data) {
+  const tag = safeLine(data.latest);
+  const version = /^v?(\d{1,4}\.\d{1,4}\.\d{1,4})(?:-rc\.\d{1,4})?$/.exec(tag);
+  const asset = data.asset;
+  if (data.state !== "available" || !version || !asset
+      || asset.url !== `${RELEASE_HOME}/download/${tag}/${asset.name}` || !/^[a-f0-9]{64}$/.test(asset.sha256)
+      || !Number.isSafeInteger(asset.size) || asset.size <= 0 || asset.size > 20 * 1024 ** 2) return null;
+  const prefix = `apollo-neb-${version[1].split(".").map(Number).join(".")}`;
+  const supportedNames = data.platform === "linux"
+    ? [`${prefix}-linux.tar.gz`, `${prefix}-linux-x64-kernel-6.6.tar.gz`, `${prefix}-linux-x64-kernel-6.12.tar.gz`]
+    : data.platform === "windows" ? [`${prefix}-windows-x64.zip`] : [];
+  if (!supportedNames.includes(asset.name)) return null;
+  return {
+    asset, tag, notes: typeof data.notes === "string" ? data.notes.slice(0, 6000) : "",
+    date: typeof data.published_at === "string" ? new Date(data.published_at) : null,
+    page: data.release_url === `${RELEASE_HOME}/tag/${tag}` ? data.release_url : "",
+    command: data.can_apply === true && data.platform === "linux" ? `apollo-neb upgrade --apply --version ${tag}` : "",
+  };
+}
+
+function releaseVerification(message = "", tone = "neutral") {
+  $("release-verify-message").dataset.tone = tone;
+  text($("release-verify-message"), message);
+}
+
+function clearReleaseCandidate() {
+  releases.candidate = null;
+  releases.verifySeq++;
+  $("release-file").value = "";
+  releaseVerification();
+  for (const id of ["release-notes", "release-verify", "release-guide"]) $(id).open = false;
+}
+
+function renderReleases() {
+  const {info, pending, candidate, tone, message} = releases;
+  const selection = RELEASE_CHANNELS.get(info?.channel);
+  const label = selection === "Тестовый" ? "Тестовый канал" : "Основной канал";
+  text($("release-summary"), info ? `${info.current} · ${label}` : "Канал и версия панели");
+  text($("release-current"), info?.current || "—");
+  text($("release-latest"), candidate?.tag || "—");
+  text($("release-platform"), RELEASE_PLATFORMS.get(info?.platform) || "—");
+  $("release-testing").checked = info?.channel === "testing";
+  $("release-stable").checked = info?.channel === "stable";
+  $("release-channels").disabled = !info || Boolean(pending);
+  $("release-check").disabled = Boolean(pending);
+  text($("release-check"), info ? "Проверить обновления" : "Повторить загрузку");
+  $("release-status").dataset.tone = pending ? "neutral" : tone;
+  text($("release-status"), pending || message);
+  $("release-candidate").hidden = !candidate || Boolean(pending);
+  for (const [id, url] of [["release-download", candidate?.asset.url], ["release-link", candidate?.page]]) {
+    const link = $(id);
+    link.hidden = !url;
+    if (url) link.href = url;
+    else link.removeAttribute("href");
+  }
+  $("release-guide").hidden = !candidate?.command;
+  $("release-manual").hidden = !candidate || Boolean(candidate.command);
+  $("release-notes").hidden = !candidate?.notes;
+  text($("release-notes-text"), candidate?.notes || "");
+  text($("release-filename"), candidate?.asset.name || "");
+  $("release-size-row").hidden = !candidate;
+  text($("release-size"), candidate ? fmt(candidate.asset.size, "байт", 0) : "");
+  const hasDate = Number.isFinite(candidate?.date?.getTime());
+  $("release-date-row").hidden = !hasDate;
+  text($("release-date"), hasDate ? candidate.date.toLocaleDateString("ru-RU") : "");
+  text($("release-digest"), candidate?.asset.sha256 || "");
+  text($("release-command"), candidate?.command || "");
+  $("release-file-row").hidden = !candidate || !window.crypto?.subtle;
+}
+
+function resetReleases() {
+  releases.seq++;
+  clearReleaseCandidate();
+  $("release-rollback").open = false;
+  Object.assign(releases, {info: null, pending: "", tone: "neutral", message: "Загружаем настройки обновлений…"});
+  renderReleases();
+}
+
+async function loadReleases({check = false, channel = null} = {}) {
+  if (releases.pending) return;
+  const seq = ++releases.seq;
+  const focus = document.activeElement;
+  const previous = releases.info;
+  if (check || channel) clearReleaseCandidate();
+  releases.pending = channel ? "Сохраняем канал…" : check ? "Проверяем обновления…" : "Загружаем настройки…";
+  renderReleases();
   try {
-    const data = await api("releases");
-    if (seq !== releaseSeq) return;
-    const current = safeLine(data.current);
-    const latest = safeLine(data.latest);
-    const prefix = current ? `Установлено: ${current}. ` : "";
-    if (data.state === "current") text($("release-status"), prefix + "Новых релизов нет.");
-    else if (data.state === "available" && latest) {
-      text($("release-status"), prefix + `Доступен релиз ${latest}.`);
-      $("release-guide").hidden = false;
-      try {
-        const url = new URL(data.url);
-        if (url.protocol === "https:" && !url.username && !url.password) {
-          link.href = url.href;
-          link.hidden = false;
-        }
-      } catch { /* Only an explicit HTTPS release address is linked. */ }
-    } else text($("release-status"), prefix + "Не удалось проверить наличие обновления.");
+    if (channel) {
+      const saved = await api("releases/channel", {channel});
+      if (seq !== releases.seq) return;
+      if (saved.channel !== channel) throw new Error();
+    }
+    const data = await api(check ? "releases" : "releases?check=0", undefined, 18000);
+    if (seq !== releases.seq) return;
+    if (!RELEASE_CHANNELS.has(data.channel) || !RELEASE_PLATFORMS.has(data.platform) || !safeLine(data.current)) {
+      throw new Error();
+    }
+    releases.info = {channel: data.channel, platform: data.platform, current: safeLine(data.current)};
+    if (previous?.channel !== data.channel || previous?.current !== data.current || previous?.platform !== data.platform) {
+      clearReleaseCandidate();
+    }
+    if (check) {
+      releases.candidate = releaseCandidate(data);
+      releases.tone = "good";
+      if (releases.candidate) releases.message = "Доступно обновление.";
+      else if (data.state === "current") releases.message = "Для этого канала обновлений нет.";
+      else {
+        releases.tone = "warn";
+        releases.message = safeLine(data.message) || "Не удалось подтвердить доступный архив.";
+      }
+    } else if (!releases.candidate) {
+      releases.message = "Нажмите «Проверить обновления».";
+      releases.tone = "neutral";
+    }
   } catch (error) {
-    if (seq !== releaseSeq) return;
+    if (seq !== releases.seq) return;
     if (error.status === 401) return showLogin(true);
-    text($("release-status"), "Проверка релизов недоступна.");
+    clearReleaseCandidate();
+    if (!check) releases.info = null;
+    releases.message = channel ? "Изменение канала не подтверждено. Загрузите настройки снова."
+      : check ? "Проверка обновлений недоступна." : "Не удалось загрузить настройки обновлений.";
+    releases.tone = "warn";
   } finally {
-    if (seq === releaseSeq) btn.disabled = false;
+    if (seq === releases.seq) {
+      releases.pending = "";
+      renderReleases();
+      if ($("release-dialog").open && [document.body, $("release-dialog")].includes(document.activeElement)) {
+        const radio = focus?.closest("#release-channels");
+        const confirmed = $("release-testing").checked ? $("release-testing") : $("release-stable");
+        (radio && releases.info ? confirmed : $("release-check")).focus({preventScroll: true});
+      }
+    }
+  }
+}
+
+function openReleases() {
+  if (state.mode !== "app") return;
+  const dialog = $("release-dialog");
+  if (dialog.open) return;
+  dialog.showModal();
+  $("release-title").focus();
+  loadReleases();
+}
+
+async function verifyReleaseFile(event) {
+  const input = event.currentTarget;
+  const file = input.files[0];
+  const asset = releases.candidate?.asset;
+  input.value = "";
+  if (!file || !asset || !window.crypto?.subtle) return;
+  const seq = ++releases.verifySeq;
+  if (file.size !== asset.size) {
+    releaseVerification("Размер файла не совпадает с размером архива релиза.", "warn");
+    return;
+  }
+  releaseVerification("Считаем SHA-256…");
+  try {
+    const digest = await window.crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+    if (seq !== releases.verifySeq) return;
+    const actual = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+    if (actual === asset.sha256) releaseVerification("SHA-256 совпадает с суммой релиза.", "good");
+    else releaseVerification("SHA-256 не совпадает. Скачайте архив заново.", "warn");
+  } catch {
+    if (seq === releases.verifySeq) releaseVerification("Не удалось прочитать файл.", "warn");
   }
 }
 
@@ -1443,7 +1585,7 @@ async function changeFleet(kind, body) {
 }
 
 function openProfile(address) {
-  if (!state.online || !state.status || $("profile-dialog").open) return;
+  if (!state.online || !state.status || !hasCapability("local_workers") || $("profile-dialog").open) return;
   const {profile, pools} = state.status;
   $("wallet").value = typeof address === "string" ? address : profile?.wallet || "";
   $("worker-name").value = profile?.worker || "";
@@ -1461,7 +1603,7 @@ function openProfile(address) {
 }
 
 function openLimits() {
-  if (!state.online || !state.status || $("limits-dialog").open) return;
+  if (!state.online || !state.status || !hasCapability("local_workers") || $("limits-dialog").open) return;
   const limits = state.status.limits || {};
   for (const key of TEMPERATURES) $(`${key}-limit`).value = limits[`${key}_limit`] ?? "";
   $("limits-ack").checked = false;
@@ -1706,7 +1848,13 @@ $("group-clear").addEventListener("click", () => {
   renderGroup(rows);
 });
 for (const action of ["start", "stop"]) $(`group-${action}`).addEventListener("click", () => groupAction(action));
-$("release-check").addEventListener("click", checkReleases);
+$("release-open").addEventListener("click", openReleases);
+$("release-check").addEventListener("click", () => loadReleases({check: Boolean(releases.info)}));
+$("release-channels").addEventListener("change", event => {
+  const channel = event.target.value;
+  if (RELEASE_CHANNELS.has(channel) && channel !== releases.info?.channel) loadReleases({channel});
+});
+$("release-file").addEventListener("change", verifyReleaseFile);
 $("fleet-refresh").addEventListener("click", loadFleet);
 $("fleet-hide-invite").addEventListener("click", clearFleetInvite);
 $("fleet-copy").addEventListener("click", () => {

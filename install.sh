@@ -11,7 +11,7 @@ fee_notice='DevFee: 1.1% of active mining time. You can see its status in the da
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help)
-      printf '%s\n' 'Apollo.NEB Linux (Python 3.10+, no sudo)' \
+      printf '%s\n' 'Apollo.NEB Linux (Python 3.10+, working pidfd, no sudo)' \
         './install.sh [--run | --service] [--prefix PATH] [--config-dir PATH] [--state-dir PATH] -- [configure options]' \
         '--run: open the local dashboard now; configure wallets and GPUs in the browser.' \
         '--service: install and start the user service; workers do not start automatically.' \
@@ -41,7 +41,17 @@ printf '\n%s\n' 'APOLLO.NEB  /  LOCAL MINING' '01 / Checking Linux and installat
 printf '%s\n' "$fee_notice" 'Mining only begins when you start a worker.'
 case "$neb_prefix" in /*) ;; *) printf 'Prefix must be absolute.\n' >&2; exit 2;; esac
 case "${neb_cfg:-/}:${neb_state:-/}" in /*:/*) ;; *) printf 'Configuration and state paths must be absolute.\n' >&2; exit 2;; esac
-python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) and sys.platform == "linux" else "Linux with Python 3.10+ is required.")'
+python3 -I -c '
+import os, sys
+if sys.version_info < (3, 10) or sys.platform != "linux":
+    sys.exit("Linux with Python 3.10+ is required.")
+sys.path.insert(0, sys.argv[1])
+from neb_runtime import Refusal, _parent_pidfd
+try:
+    os.close(_parent_pidfd())
+except Refusal as error:
+    sys.exit(str(error))
+' "$src"
 python3 -I "$src/neb_install_check.py" "$neb_prefix" "$HOME" "$service"
 if [ "$service" -eq 1 ]; then
   test "$neb_prefix" = "$HOME/.local" && test -z "${neb_cfg:-}${neb_state:-}" &&
@@ -59,8 +69,8 @@ base="$neb_prefix/lib/apollo-neb"
 mkdir -p -- "$base" "$neb_prefix/bin"
 release=$(mktemp -d "$base/release.XXXXXXXX")
 install -d -m0700 "$release/web"
-modules='neb.py neb_core.py neb_app.py neb_history.py neb_runtime.py neb_setup.py neb_wallet.py neb_release.py neb_fleet.py neb_devfee.py neb_devfee_owner.py neb_network.py developer-support.json'
-assets='index.html ui.js ui.css brand.svg qr.js devfee.html devfee.js view.html view.js live-metrics.js recovery-codes.js history-chart.js select-menu.js'
+modules='neb.py neb_core.py neb_app.py neb_history.py neb_runtime.py neb_setup.py neb_wallet.py neb_release.py neb_fleet.py neb_devfee.py neb_network.py developer-support.json'
+assets='index.html ui.js ui.css brand.svg qr.js view.html view.js live-metrics.js recovery-codes.js history-chart.js select-menu.js'
 for f in $modules; do install -m0600 "$src/$f" "$release/$f"; done
 for f in $assets; do install -m0600 "$src/web/$f" "$release/web/$f"; done
 printf '%s\n' '02 / Preparing the administrator account'

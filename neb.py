@@ -24,7 +24,6 @@ sys.path.insert(0, str(HERE))
 
 import neb_app
 import neb_core as core
-from neb_devfee_owner import OwnerPolicy
 import neb_runtime
 import neb_setup
 import neb_release
@@ -33,6 +32,9 @@ from neb_release import VERSION
 
 
 def private(path):
+    if sys.platform == "win32":
+        import neb_windows
+        return neb_windows.private(path)
     if not path.is_absolute() or path != path.resolve() or path in (Path.home(), *Path.home().parents):
         raise ValueError("Укажите абсолютный путь к приватному каталогу, не ссылку.")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -43,8 +45,14 @@ def private(path):
 
 
 def paths(args, name="apollo-neb"):
-    cfg = args.config_dir or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / name
-    state = args.state_dir or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / name
+    if sys.platform == "win32":
+        import neb_windows
+        default_cfg, default_state = neb_windows.defaults()
+    else:
+        default_cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / name
+        default_state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / name
+    cfg = args.config_dir or default_cfg
+    state = args.state_dir or default_state
     if (not cfg.is_absolute() or not state.is_absolute() or cfg != cfg.resolve() or state != state.resolve()
             or cfg == state or cfg in state.parents or state in cfg.parents):
         raise ValueError("Каталоги настроек и состояния должны быть отдельными абсолютными путями без ссылок.")
@@ -111,11 +119,42 @@ def configure_locked(args, cfg, state):
     support = release_support()
     if support["wallet"] == profile["wallet"]:
         raise ValueError("Адрес поддержки и адрес добычи не могут совпадать.")
+    limits = core.limits(core.read(cfg / "limits.json", core.LIMITS))
+    settings, enrollment = configure_login(args, cfg, state, old)
+    core.store(settings_path(cfg), settings)
+    core.store(cfg / "profile.json", profile)
+    core.store(cfg / "pools.json", list(checked_pools.values()))
+    core.store(cfg / "workers.json", workers)
+    core.store(cfg / "limits.json", limits)
+    print(f"Настройки: {cfg}\nАдрес панели: http://127.0.0.1:{settings['port']}\n"
+          f"Воркеров: {len(workers)}. Майнинг не запущен.")
+    print("DevFee: 1,1% активного времени майнинга.")
+    enroll(enrollment)
+
+
+def configure_controller(args):
+    cfg, state = paths(args)
+    private(cfg)
+    with lock_state(private(state)):
+        old = core.read(settings_path(cfg))
+        if old is not None:
+            require_controller_settings(old)
+        settings, enrollment = configure_login(args, cfg, state, old or {})
+        core.store(settings_path(cfg), {**settings, "mode": "windows-controller"})
+        print(f"Контроллер нод Windows: http://127.0.0.1:{settings['port']}")
+        enroll(enrollment)
+
+
+def require_controller_settings(settings):
+    if not isinstance(settings, dict) or settings.get("mode") != "windows-controller":
+        raise ValueError("Для контроллера Windows нужен отдельный каталог настроек.")
+
+
+def configure_login(args, cfg, state, old):
     origin = neb_app.validated_origin(args.origin if args.origin is not None else old.get("origin"))
     port = args.port if args.port is not None else old.get("port", 18763)
-    if not 1024 <= port <= 65535:
+    if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Порт должен быть в диапазоне 1024–65535.")
-    limits = core.limits(core.read(cfg / "limits.json", core.LIMITS))
     login_path = cfg / "login.json"
     login = core.read(login_path, None)
     enrollment = None
@@ -129,14 +168,7 @@ def configure_locked(args, cfg, state):
     private(cfg)
     if not login_path.exists():
         core.store(login_path, login)
-    core.store(settings_path(cfg), {"origin": origin, "port": port})
-    core.store(cfg / "profile.json", profile)
-    core.store(cfg / "pools.json", list(checked_pools.values()))
-    core.store(cfg / "workers.json", workers)
-    core.store(cfg / "limits.json", limits)
-    print(f"Настройки: {cfg}\nАдрес панели: http://127.0.0.1:{port}\nВоркеров: {len(workers)}. Майнинг не запущен.")
-    print("DevFee: 1,1% активного времени майнинга.")
-    enroll(enrollment)
+    return {"origin": origin, "port": port}, enrollment
 
 
 def prompt_login(args):
@@ -157,6 +189,9 @@ def enroll(secret):
 
 
 def lock_state(state):
+    if sys.platform == "win32":
+        import neb_windows
+        return neb_windows.lock(state)
     import fcntl
     handle = (state / "service.lock").open("a+", encoding="utf-8")
     try:
@@ -169,6 +204,9 @@ def lock_state(state):
 
 def rotate_password(args):
     cfg, state = paths(args)
+    if sys.platform == "win32":
+        private(cfg)
+        require_controller_settings(core.read(settings_path(cfg)))
     old = core.read(cfg / "login.json")
     if old is None:
         raise ValueError("Сначала выполните configure.")
@@ -194,48 +232,59 @@ def linux_boot():
     return boot_id, reboot_at
 
 
-def serve(args):
+def serve(args, *, controller=False):
     import neb_fleet
     cfg, state = paths(args)
+    if controller:
+        private(cfg)
+        private(state)
     login = core.read(cfg / "login.json", None)
     settings = core.read(settings_path(cfg), None)
     if login is None or settings is None:
-        raise ValueError("Сначала выполните ./install.sh или apollo-neb configure.")
+        raise ValueError("Сначала выполните configure.")
+    if controller:
+        require_controller_settings(settings)
     port = settings["port"]
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Укажите допустимый непривилегированный порт.")
-    support = release_support()
-    private(cfg)
-    private(state)
+    support = None if controller else release_support()
+    if not controller:
+        private(cfg)
+        private(state)
     with lock_state(state):
         auth = core.Auth(login, state / "auth.sqlite")
         if settings.get("origin") and not auth.is_totp_enabled():
             raise ValueError("Внешний адрес допускается только с TOTP.")
-        workers = neb_runtime.validate_workers(core.read(cfg / "workers.json", []))
+        workers = [] if controller else neb_runtime.validate_workers(core.read(cfg / "workers.json", []))
         runtime = neb_runtime.Manager(workers, state)
-        service = neb_app.Service(cfg,state,runtime,core.read(cfg/"pools.json",core.DEFAULT_POOLS),support,
-                                  setup=neb_setup.Setup(state),wallets=neb_wallet.WalletStore(state),
-                                  releases=neb_release.Releases(),fleet=neb_fleet.Fleet(state/"fleet.sqlite"))
+        service = neb_app.Service(
+            cfg, state, runtime, core.read(cfg / "pools.json", core.DEFAULT_POOLS), support,
+            setup=None if controller else neb_setup.Setup(state),
+            wallets=None if controller else neb_wallet.WalletStore(state),
+            releases=neb_release.Releases(), fleet=neb_fleet.Fleet(state / "fleet.sqlite"),
+            controller_only=controller,
+        )
         server = neb_app.Server(("127.0.0.1", port), service, auth, HERE / "web", settings.get("origin"))
-        boot_id, reboot_at = linux_boot()
+        boot_id, reboot_at = (None, None) if controller else linux_boot()
         service.archive.note_start(int(time.time()), boot_id=boot_id, reboot_at=reboot_at)
         service.poll()
         background = threading.Thread(target=service.loop, name="neb-monitor", daemon=True)
         background.start()
-        fee_monitor = threading.Thread(target=service.devfee.loop, args=(service.stopping,),
-                                      name="neb-devfee", daemon=True)
-        fee_monitor.start()
-        link = core.read(cfg/"fleet-link.json")
-        if isinstance(link,dict) and link.get("paired") is True:
-            follower = neb_fleet.Client(link["origin"],link["id"],link["key"],link_receipts(state,link),
-                                        allow_loopback=link.get("allow_loopback") is True)
-            threading.Thread(target=node_loop,args=(service,follower),daemon=True,name="neb-node").start()
+        if not controller:
+            threading.Thread(target=service.devfee.loop, args=(service.stopping,),
+                             name="neb-devfee", daemon=True).start()
+            link = core.read(cfg / "fleet-link.json")
+            if isinstance(link, dict) and link.get("paired") is True:
+                follower = neb_fleet.Client(link["origin"], link["id"], link["key"], link_receipts(state, link),
+                                            allow_loopback=link.get("allow_loopback") is True)
+                threading.Thread(target=node_loop, args=(service, follower), daemon=True, name="neb-node").start()
 
         def stop(_signum, _frame):
             raise KeyboardInterrupt()
 
         signal.signal(signal.SIGTERM, stop)
-        print(f"Apollo.NEB {VERSION}: http://127.0.0.1:{server.server_port}", flush=True)
+        label = "Apollo.NEB Windows · контроллер нод" if controller else "Apollo.NEB"
+        print(f"{label} {VERSION}: http://127.0.0.1:{server.server_port}", flush=True)
         try:
             server.serve_forever(poll_interval=0.4)
         except KeyboardInterrupt:
@@ -244,41 +293,6 @@ def serve(args):
             service.close()
             server.server_close()
             background.join(timeout=3)
-
-
-def devfee_owner(args):
-    cfg, state = paths(args, "apollo-neb-devfee")
-    private(cfg)
-    private(state)
-    with lock_state(state):
-        login_path = cfg / "owner-login.json"
-        settings_file = cfg / "owner-settings.json"
-        login = core.read(login_path)
-        if args.owner_action == "configure":
-            port = args.port
-            if not 1024 <= port <= 65535:
-                raise ValueError("Укажите допустимый непривилегированный порт.")
-            origin = neb_app.validated_origin(args.origin)
-            if login is None:
-                login, key = prompt_login(args)
-                core.store(login_path, login)
-                enroll(key)
-            core.store(settings_file, {"origin": origin, "port": port})
-            print(f"Панель владельца DevFee: http://127.0.0.1:{port}")
-            return
-        settings = core.read(settings_file)
-        if login is None or settings is None:
-            raise ValueError("Сначала выполните apollo-neb devfee-owner configure.")
-        auth = core.Auth(login, state / "owner-auth.sqlite")
-        owner = OwnerPolicy(state / "devfee-policy.json")
-        if args.enroll and auth.is_totp_enabled():
-            raise ValueError("2FA владельца уже настроена.")
-        origin = None if args.enroll else settings["origin"]
-        with neb_app.Server(("127.0.0.1", settings["port"]), None, auth, HERE / "web", origin,
-                            owner=owner, owner_enrollment=args.enroll) as server:
-            print(f"Панель владельца DevFee: http://127.0.0.1:{server.server_port}", flush=True)
-            server.serve_forever(poll_interval=0.4)
-
 
 def node_loop(service, follower):
     def execute(action, ids):
@@ -326,58 +340,62 @@ def pair_node(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Apollo.NEB · локальное управление добычей")
+    controller = sys.platform == "win32"
+    parser = argparse.ArgumentParser(description="Apollo.NEB · контроллер Linux-нод для Windows x64" if controller
+                                     else "Apollo.NEB · локальное управление добычей")
     parser.add_argument("--version", action="version", version=f"Apollo.NEB {VERSION}")
     parser.add_argument("--config-dir", type=Path, help="явный путь вместо XDG_CONFIG_HOME")
     parser.add_argument("--state-dir", type=Path, help="явный путь вместо XDG_STATE_HOME")
     sub = parser.add_subparsers(dest="action", required=True)
     command = sub.add_parser("configure", help="проверить и сохранить параметры",
-                             description="DevFee 1,1% активного времени. Майнинг запускаете вы.")
-    command.add_argument("--wallet", help="публичный адрес NEB Mainnet")
-    command.add_argument("--worker", help="метка воркера в пуле")
-    command.add_argument("--pool", help="идентификатор из pools.json")
-    command.add_argument("--pools", type=Path, help="импорт списка пулов из JSON")
-    command.add_argument("--workers", type=Path, help="импорт списка воркеров из JSON")
+                             description="Настройка входа в контроллер Linux-нод." if controller else
+                             "DevFee 1,1% активного времени. Майнинг запускаете вы.")
+    if not controller:
+        command.add_argument("--wallet", help="публичный адрес NEB Mainnet")
+        command.add_argument("--worker", help="метка воркера в пуле")
+        command.add_argument("--pool", help="идентификатор из pools.json")
+        command.add_argument("--pools", type=Path, help="импорт списка пулов из JSON")
+        command.add_argument("--workers", type=Path, help="импорт списка воркеров из JSON")
+        command.add_argument("--publish-current",type=Path,help=argparse.SUPPRESS)
     command.add_argument("--port", type=int, help="порт HTTP на 127.0.0.1 (по умолчанию 18763)")
     command.add_argument("--origin", help="внешний HTTPS origin (только за своим обратным прокси)")
     command.add_argument("--totp", action="store_true", help="на первой установке подключить двухфакторный вход")
     command.add_argument("--password-stdin", action="store_true", help="для автоматизации: прочитать пароль из stdin, не передавать в аргументах")
-    command.add_argument("--publish-current",type=Path,help=argparse.SUPPRESS)
     command = sub.add_parser("password", help="сменить пароль в остановленной панели и отозвать сессии")
     command.add_argument("--totp", action="store_true", help="выдать новый ключ TOTP")
     command.add_argument("--password-stdin", action="store_true")
-    sub.add_parser("devices", help="показать обнаруженные PCI GPU и доступность показаний")
-    sub.add_parser("serve", help="запустить локальную панель без автоматического запуска воркеров")
-    owner = sub.add_parser("devfee-owner", help="изолированная панель владельца для паузы DevFee")
-    owner_sub = owner.add_subparsers(dest="owner_action", required=True)
-    owner_setup = owner_sub.add_parser("configure", help="настроить отдельный вход владельца с 2FA")
-    owner_setup.add_argument("--port", type=int, default=18764)
-    owner_setup.add_argument("--origin", help="внешний HTTPS origin панели владельца")
-    owner_setup.add_argument("--password-stdin", action="store_true")
-    owner_setup.set_defaults(totp=False)
-    owner_serve = owner_sub.add_parser("serve", help="запустить панель управления и публичное чтение состояния")
-    owner_serve.add_argument("--enroll", action="store_true", help="привязать 2FA из браузера на loopback")
-    command = sub.add_parser("upgrade",help="проверить официальный релиз; установка только с --apply")
-    command.add_argument("--apply",action="store_true")
-    command.add_argument("--service",action="store_true",help="запустить пользовательскую службу после установки")
-    command = sub.add_parser("node-pair",help="подключить этот узел к центральной панели")
-    command.add_argument("--origin",required=True,help="HTTPS адрес центральной панели")
-    command.add_argument("--id",required=True,help="идентификатор из центральной панели")
-    command.add_argument("--allow-loopback",action="store_true",help="разрешить HTTP только в локальном SSH-туннеле")
-    sub.add_parser("node-unpair",help="отключить исходящее соединение этой панели; сначала отзовите узел на центральной")
+    sub.add_parser("serve", help="запустить контроллер Linux-нод" if controller else
+                   "запустить локальную панель без автоматического запуска воркеров")
+    command = sub.add_parser("upgrade", help="проверить официальный релиз" if controller else
+                             "проверить официальный релиз; установка только с --apply")
+    command.add_argument("--version", help="точный тег GitHub Releases")
+    command.add_argument("--apply", action="store_true", help=argparse.SUPPRESS if controller else
+                         "установить выбранный релиз Linux")
+    command.add_argument("--service", action="store_true", help=argparse.SUPPRESS if controller else
+                         "запустить пользовательскую службу после установки")
+    if not controller:
+        sub.add_parser("devices", help="показать обнаруженные PCI GPU и доступность показаний")
+        command = sub.add_parser("node-pair", help="подключить этот узел к центральной панели")
+        command.add_argument("--origin", required=True, help="HTTPS адрес центральной панели")
+        command.add_argument("--id", required=True, help="идентификатор из центральной панели")
+        command.add_argument("--allow-loopback", action="store_true",
+                             help="разрешить HTTP только в локальном SSH-туннеле")
+        sub.add_parser("node-unpair", help="отключить исходящее соединение этой панели")
     args = parser.parse_args()
-    os.umask(0o077)
     try:
-        if sys.platform != "linux" or os.geteuid() == 0:
+        if controller:
+            import neb_windows
+            neb_windows.require_x64()
+        elif sys.platform != "linux" or os.geteuid() == 0:
             raise ValueError("Apollo.NEB запускается в Linux от обычного выделенного пользователя, без sudo.")
+        else:
+            os.umask(0o077)
         if args.action == "configure":
-            configure(args)
+            (configure_controller if controller else configure)(args)
         elif args.action == "password":
             rotate_password(args)
         elif args.action == "devices":
             print(json.dumps(neb_runtime.discover_devices(), ensure_ascii=False, indent=2))
-        elif args.action == "devfee-owner":
-            devfee_owner(args)
         elif args.action == "node-pair":
             pair_node(args)
         elif args.action == "node-unpair":
@@ -386,15 +404,17 @@ def main():
                 (cfg/"fleet-link.json").unlink(missing_ok=True)
             print("Локальная привязка снята.")
         elif args.action == "upgrade":
+            if controller and (args.apply or args.service):
+                raise ValueError("Обновление Windows устанавливается распаковкой проверенного ZIP.")
             cfg, state = paths(args)
             if args.apply:
                 with lock_state(private(state)):
                     pass
             parent = HERE.parent
             prefix = parent.parent.parent if parent.name == "apollo-neb" and parent.parent.name == "lib" else Path.home()/".local"
-            neb_release.upgrade(cfg,state,prefix=prefix,apply=args.apply,service=args.service)
+            neb_release.upgrade(cfg, state, prefix=prefix, apply=args.apply, service=args.service, tag=args.version)
         else:
-            serve(args)
+            serve(args, controller=controller)
     except (ValueError, RuntimeError, OSError, EOFError, KeyboardInterrupt, subprocess.SubprocessError) as exc:
         print(f"Apollo.NEB: {exc or 'отменено'}", file=sys.stderr)
         return 1

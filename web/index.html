@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="description" content="Локальная панель майнинга NEB для Linux">
+  <meta name="description" content="Панель управления воркерами NEB">
   <title>Apollo.NEB — панель майнинга</title>
   <link rel="icon" type="image/svg+xml" href="/brand.svg">
   <link rel="stylesheet" href="/ui.css">
@@ -48,7 +48,7 @@
     <section id="login" class="gate surface" hidden>
       <span class="tile-icon"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg></span>
       <h1>Вход в Apollo.NEB</h1>
-      <p>Введите пароль администратора, заданный при установке на Linux.</p>
+      <p>Введите пароль администратора, заданный при настройке панели.</p>
       <form id="login-form">
         <label>Пароль<input id="password" type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>
         <label id="login-code-row" for="login-code" hidden>Код 2FA или резервный код
@@ -63,7 +63,7 @@
     <div id="app" hidden>
       <div class="page-header">
         <div>
-          <p class="eyebrow">КОНСОЛЬ МАЙНИНГА <span aria-hidden="true">/</span> LINUX</p>
+          <p class="eyebrow">КОНСОЛЬ МАЙНИНГА</p>
           <h1 id="page-title">Обзор фермы</h1>
         </div>
         <div class="page-actions">
@@ -95,6 +95,10 @@
             <li><span class="step-number">03</span><div><h3 id="step-workers-title">Добавьте воркеры</h3><p>Выберите обнаруженные GPU. Добавление воркеров не запускает майнинг.</p></div><button type="button" data-discovery>Найти устройства</button></li>
           </ol>
           <p id="setup-support" class="support-note"></p>
+        </section>
+        <section id="controller-note" class="surface controller-note" aria-labelledby="controller-title" hidden>
+          <div><h2 id="controller-title">Контроллер нод</h2><p>Подключите Linux-ноду в разделе «Ноды», чтобы следить за её воркерами и управлять ими.</p></div>
+          <button type="button" data-go="nodes">К нодам<svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button>
         </section>
         <section id="attention" class="attention" hidden aria-labelledby="attention-title">
           <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
@@ -143,11 +147,11 @@
               <p id="network-message" class="subline" role="status">Данные Suprnova загружаются по запросу.</p>
               <div class="panel-actions"><button type="button" id="network-check">Обновить данные сети</button></div>
             </section>
-            <section class="surface release" aria-labelledby="release-title">
-              <div class="panel-head"><div><h2 id="release-title">Релизы</h2><p>Обновления устанавливаются вручную.</p></div></div>
-              <p id="release-status" class="subline" role="status">Проверка выполняется по запросу.</p>
-              <div class="panel-actions"><button type="button" id="release-check">Проверить релиз</button><a id="release-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Открыть страницу релиза</a></div>
-              <p id="release-guide" class="subline" hidden>Остановите панель и выполните в терминале <code>apollo-neb upgrade --apply</code>. Флаг <code>--service</code> перезапустит установленную пользовательскую службу.</p>
+            <section class="surface release" aria-labelledby="release-card-title">
+              <div class="panel-head"><div><h2 id="release-card-title">Обновления</h2><p id="release-summary">Канал и версия панели</p></div></div>
+              <button type="button" id="release-open" class="text-button" aria-haspopup="dialog">
+                Открыть настройки<svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg>
+              </button>
             </section>
           </div>
         </div>
@@ -195,6 +199,61 @@
     </div>
   </main>
   <footer class="frame foot"><span>Apollo.NEB</span><span>Локальная панель · время браузера</span></footer>
+  <dialog id="release-dialog" aria-labelledby="release-title">
+    <div class="dialog-head"><h2 id="release-title" tabindex="-1">Обновления</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <dl class="release-facts" aria-label="Версии и система">
+      <div><dt>Установлена</dt><dd id="release-current">—</dd></div>
+      <div><dt>Доступна</dt><dd id="release-latest">—</dd></div>
+      <div><dt>Система панели</dt><dd id="release-platform">—</dd></div>
+    </dl>
+    <fieldset id="release-channels" class="release-channels" aria-describedby="release-channel-help" disabled>
+      <legend>Канал обновлений</legend>
+      <div class="release-segments">
+        <label><input type="radio" name="release-channel" id="release-stable" value="stable"><span>Основной</span></label>
+        <label><input type="radio" name="release-channel" id="release-testing" value="testing"><span>Тестовый</span></label>
+      </div>
+      <p id="release-channel-help" class="subline">Тестовый канал включает предварительные выпуски.</p>
+    </fieldset>
+    <div class="release-check-row">
+      <button type="button" class="primary" id="release-check" disabled>Проверить обновления</button>
+      <p id="release-status" class="subline" role="status">Загружаем настройки обновлений…</p>
+    </div>
+    <div id="release-candidate" class="release-candidate" hidden>
+      <dl class="release-asset">
+        <div><dt>Файл релиза</dt><dd id="release-filename"></dd></div>
+        <div id="release-size-row" hidden><dt>Размер</dt><dd id="release-size"></dd></div>
+        <div id="release-date-row" hidden><dt>Опубликован</dt><dd id="release-date"></dd></div>
+      </dl>
+      <div class="panel-actions release-links">
+        <a id="release-download" class="release-link" target="_blank" rel="noopener noreferrer" hidden>Скачать архив</a>
+        <a id="release-link" class="release-link" target="_blank" rel="noopener noreferrer" hidden>Страница релиза</a>
+      </div>
+      <details id="release-notes" class="release-detail" hidden>
+        <summary>Что изменилось</summary>
+        <p id="release-notes-text"></p>
+      </details>
+      <details id="release-verify" class="release-detail">
+        <summary>Проверка SHA-256</summary>
+        <code id="release-digest" class="release-digest"></code>
+        <label id="release-file-row" class="release-file" hidden>
+          <input id="release-file" type="file" aria-describedby="release-verify-message">
+          <span>Сверить скачанный архив</span>
+        </label>
+        <p id="release-verify-message" class="subline" role="status"></p>
+      </details>
+      <details id="release-guide" class="release-detail" hidden>
+        <summary>Установка на Linux</summary>
+        <p>Остановите панель и сделайте приватную копию настроек и состояния. Затем выполните в терминале:</p>
+        <code id="release-command" class="release-digest"></code>
+        <p>После установки запустите панель тем же способом.</p>
+      </details>
+      <p id="release-manual" class="subline" hidden>Сверьте контрольную сумму и следуйте инструкции на странице релиза.</p>
+    </div>
+    <details id="release-rollback" class="release-detail release-rollback">
+      <summary>Откат</summary>
+      <p>Остановите панель и восстановите предыдущий код вместе с соответствующей резервной копией настроек и состояния. Запустите панель и проверьте её версию и вход.</p>
+    </details>
+  </dialog>
   <dialog id="worker-log-dialog" aria-labelledby="worker-log-title">
     <div class="dialog-head"><h2 id="worker-log-title">Журнал воркера</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <p id="worker-log-name" class="subline"></p>

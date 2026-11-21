@@ -16,6 +16,7 @@ import neb_app
 import neb_core as core
 import neb_fleet
 import neb_release
+from test_neb_release import release
 from neb import persisted_totp
 from test_neb_server import ExampleWorker
 from test_neb_core import OWNER
@@ -110,14 +111,10 @@ class OnboardingTests(unittest.TestCase):
 
 class ReleaseTests(unittest.TestCase):
     def test_release_catalog_excludes_versions_before_first_mandatory_devfee(self):
-        def record(tag, base):
-            asset = {"name": f"apollo-neb-{base}-linux.tar.gz", "size": 900, "digest": "sha256:" + "a" * 64}
-            return {"draft": False, "tag_name": tag, "assets": [asset]}
-
-        retired = [record("v0.6.0-rc.1", "0.6.0"), record("v0.7.0-rc.1", "0.7.0")]
-        self.assertIsNone(neb_release.select(retired))
-        current = record("v0.7.1-rc.1", "0.7.1")
-        self.assertEqual(neb_release.select([*retired, current])[1], "v0.7.1-rc.1")
+        retired = [release("v0.6.0-rc.1"), release("v0.7.0-rc.1")]
+        self.assertIsNone(neb_release.select(retired, channel="testing"))
+        current = release("v0.7.1-rc.1")
+        self.assertEqual(neb_release.select([*retired, current], channel="testing").tag, "v0.7.1-rc.1")
 
     def test_staging_reads_legacy_auth_without_migrating_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -131,13 +128,11 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT * FROM auth").fetchall(),[(1,15)])
 
     def test_decay_to_alternative_only_when_exact_release_asset_is_valid(self):
-        def record(tag,name):
-            return {"draft":False,"tag_name":tag,"assets":[{"name":name,"size":900,"digest":"sha256:"+"a"*64}]}
-        resolved = neb_release.select([record("v2.0.0","wrong.tar.gz"),
-                                       record("v1.0.1-rc.2","apollo-neb-1.0.1-linux.tar.gz"),
-                                       record("v1.0.1","apollo-neb-1.0.1-linux.tar.gz")])
-        self.assertEqual(resolved[1],"v1.0.1")
-        self.assertEqual(resolved[3].url,"https://github.com/ALTIS13/Apollo.NEB/releases/download/v1.0.1/apollo-neb-1.0.1-linux.tar.gz")
+        resolved = neb_release.select([release("v2.0.0", "wrong.tar.gz"),
+                                       release("v1.0.1-rc.2"), release("v1.0.1")])
+        self.assertEqual(resolved.tag, "v1.0.1")
+        self.assertEqual(resolved.asset.url,
+                         "https://github.com/ALTIS13/Apollo.NEB/releases/download/v1.0.1/apollo-neb-1.0.1-linux.tar.gz")
 
     def test_release_import_rejects_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:

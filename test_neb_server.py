@@ -107,6 +107,9 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertIn("HttpOnly; SameSite=Strict", cookie)
                 cookie = cookie.split(";", 1)[0]
+                self.assertEqual(req("GET", "/api/devfee", cookie=cookie)[0], 404)
+                self.assertEqual(req("POST", "/api/devfee", {"paused": True}, cookie=cookie)[0], 404)
+                self.assertEqual(req("GET", "/policy", cookie=cookie)[0], 404)
                 self.assertEqual(req("GET", "/api/network", cookie=cookie)[1]["state"], "unchecked")
                 self.assertEqual(req("GET", "/api/logs?worker=other", cookie=cookie)[0], 400)
                 code, logs, _ = req("GET", "/api/logs?worker=gpu", cookie=cookie)
@@ -123,6 +126,18 @@ class ServerTests(unittest.TestCase):
                 conn.close()
                 server.shutdown()
                 thread.join()
+
+    def test_controller_disables_local_mutations_even_with_a_worker_row(self):
+        service = app.Service(self.conf, self.base / "state", self.runtime, core.DEFAULT_POOLS, None,
+                              devfee=self.policy, controller_only=True)
+        service.poll()
+        self.assertEqual(service.status()["capabilities"], {"local_workers": False, "wallet_tools": False})
+        for action in ("start", "stop", "profile", "limits"):
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, "Ноды"):
+                service.change(action, {"id": "gpu"})
+        with self.assertRaisesRegex(ValueError, "Ноды"):
+            service.group("start", ["gpu"])
+        self.assertEqual(self.runtime.calls, [])
 
     def test_thermal_stop_is_in_history_without_an_active_output_rate(self):
         now = self.service.last + 20

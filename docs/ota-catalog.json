@@ -1,0 +1,36 @@
+[
+  {
+    "tag_name": "v0.8.0-rc.1",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-11-21T16:15:24Z",
+    "html_url": "https://github.com/ALTIS13/Apollo.NEB/releases/tag/v0.8.0-rc.1",
+    "body": "# Apollo.NEB 0.8.0-rc.1 · Linux Portable\n\nПредварительный выпуск самостоятельной панели добычи NEB Mainnet.\n\n- Обзор и карточки воркеров показывают текущие температуры целыми градусами и стрелками тренда.\n- Списки периода, метрик, событий и пулов оформлены в стиле панели и поддерживают управление клавиатурой.\n- История за 31 день включает график с указателем, температурные пороги, метки термозащиты, запуска панели и перезагрузки хоста.\n- Журнал воркера обновляется автоматически. Экран `/view` показывает сводные метрики без входа.\n- Блок Mainnet показывает высоту блока и валовую оценку NEB за сутки по локальным замерам и данным Suprnova.\n- Резервные коды 2FA скачиваются из панели в Markdown.\n\n**DevFee — 1,1% активного времени добычи.** В панели видны активное окно, пауза владельца и недоступность сервиса.\n\nУстановите `apollo-neb-0.8.0-linux.tar.gz` после проверки файла `.sha256`. Для обновления и отката используйте [инструкцию](https://github.com/ALTIS13/Apollo.NEB/blob/main/docs/onboarding-and-distribution.md).\n\nУстановка и управление процессами проверены на изолированном Linux с тестовым воркером. Физические GPU и выплаты пула требуют отдельной проверки.\n",
+    "assets": [
+      {
+        "name": "apollo-neb-0.8.0-linux.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.8.0-rc.1/apollo-neb-0.8.0-linux.tar.gz",
+        "digest": "sha256:bed7a78d182d8e0dad96943bd1f325401d93880c5154263062e118030319b337",
+        "size": 145928,
+        "state": "uploaded"
+      }
+    ]
+  },
+  {
+    "tag_name": "v0.7.1-rc.1",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-11-21T06:51:27Z",
+    "html_url": "https://github.com/ALTIS13/Apollo.NEB/releases/tag/v0.7.1-rc.1",
+    "body": "# Apollo.NEB 0.7.1-rc.1 · Linux Portable\n\nПредварительный выпуск. Установочный архив называется `apollo-neb-0.7.1-linux.tar.gz`. Перед распаковкой проверьте его по файлу `.sha256` с той же [страницы выпуска](https://github.com/ALTIS13/Apollo.NEB/releases/tag/v0.7.1-rc.1).\n\n**DevFee — 0,5% активного времени добычи.** Майнинг начинается по команде оператора.\n\nВыпуск подходит для [отката](https://github.com/ALTIS13/Apollo.NEB/blob/main/docs/onboarding-and-distribution.md#откат) с записанной до обновления копией настроек и состояния.\n",
+    "assets": [
+      {
+        "name": "apollo-neb-0.7.1-linux.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.7.1-rc.1/apollo-neb-0.7.1-linux.tar.gz",
+        "digest": "sha256:52d442bf531ed4a83f322f5cb100e8739758de3de9d082990c7131b69ead4414",
+        "size": 113923,
+        "state": "uploaded"
+      }
+    ]
+  }
+]

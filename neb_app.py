@@ -22,8 +22,9 @@ HERE = Path(__file__).resolve().parent
 
 class Service:
     def __init__(self, config, state, runtime, pools, support, *, setup=None, wallets=None, releases=None, fleet=None,
-                 devfee=None):
+                 devfee=None, controller_only=False):
         self.config, self.runtime = config, runtime
+        self.controller_only = controller_only
         self.lock, self.stopping = threading.RLock(), threading.Event()
         self.archive = Archive(state / "history.sqlite")
         self.pools = core.pools(pools)
@@ -53,6 +54,8 @@ class Service:
             return {"ids":[r["id"] for r in new]}
 
     def group(self, action, ids):
+        if self.controller_only:
+            raise ValueError("Для управления воркерами откройте раздел Ноды.")
         if action not in ("start","stop") or not isinstance(ids,list) or not 1 <= len(ids) <= 24 or any(
                 not isinstance(i,str) for i in ids) or len(set(ids)) != len(ids):
             raise ValueError("Выберите от 1 до 24 разных воркеров.")
@@ -87,6 +90,8 @@ class Service:
                            limits=self.limits, **options)
 
     def change(self, command, body):
+        if self.controller_only:
+            raise ValueError("Для управления воркерами откройте раздел Ноды.")
         with self.lock:
             if command in ("start", "stop"):
                 id_ = body.get("id")
@@ -231,6 +236,7 @@ class Service:
             else:
                 support_state = "counting" if any(row["state"] == "running" for row in self.rows) else "idle"
             return {"time": self.last, "workers": self.rows, "profile": self.profile,
+                    "capabilities": {"local_workers": not self.controller_only, "wallet_tools": self.wallets is not None},
                     "pools": [{"id": p["id"], "label": p["label"]} for p in self.pools.values()],
                     "limits": self.limits, "support": {"enabled": self.clock.cfg["enabled"],
                     "basis_points": self.clock.cfg["basis_points"], "active_workers": active, "state": support_state}}
@@ -291,33 +297,26 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 32
 
-    def __init__(self, address, service, auth, web_dir, origin, *, owner=None, owner_enrollment=False):
+    def __init__(self, address, service, auth, web_dir, origin):
         if address[0] != "127.0.0.1":
             raise ValueError("Прямой доступ разрешён только с loopback.")
         self.service, self.auth, self.public_origin = service, auth, validated_origin(origin)
-        self.owner, self.owner_enrollment = owner, owner_enrollment
-        if owner_enrollment and (owner is None or self.public_origin is not None):
-            raise ValueError("Привязка 2FA владельца доступна только на loopback.")
-        if owner is not None and not owner_enrollment and not auth.is_totp_enabled():
-            raise ValueError("Для управления DevFee настройте вход с 2FA.")
         self.active_requests = threading.BoundedSemaphore(24)
         self.assets = {}
-        entry, script = ("devfee.html", "devfee.js") if owner is not None else ("index.html", "ui.js")
-        for route, file, mime in (("/", entry, "text/html; charset=utf-8"),
+        for route, file, mime in (("/", "index.html", "text/html; charset=utf-8"),
                                   ("/ui.css", "ui.css", "text/css; charset=utf-8"),
-                                  ("/ui.js", script, "text/javascript; charset=utf-8"),
+                                  ("/ui.js", "ui.js", "text/javascript; charset=utf-8"),
                                   ("/brand.svg", "brand.svg", "image/svg+xml"),
                                   ("/favicon.ico", "brand.svg", "image/svg+xml"),
                                   ("/recovery-codes.js", "recovery-codes.js", "text/javascript; charset=utf-8"),
                                   ("/qr.js", "qr.js", "text/javascript; charset=utf-8")):
             if route in ("/","/ui.css","/ui.js") or (web_dir / file).is_file():
                 self.assets[route] = ((web_dir / file).read_bytes(), mime)
-        if owner is None:
-            self.assets["/view"] = ((web_dir / "view.html").read_bytes(), "text/html; charset=utf-8")
-            self.assets["/view.js"] = ((web_dir / "view.js").read_bytes(), "text/javascript; charset=utf-8")
-            self.assets["/live-metrics.js"] = ((web_dir / "live-metrics.js").read_bytes(), "text/javascript; charset=utf-8")
-            self.assets["/history-chart.js"] = ((web_dir / "history-chart.js").read_bytes(), "text/javascript; charset=utf-8")
-            self.assets["/select-menu.js"] = ((web_dir / "select-menu.js").read_bytes(), "text/javascript; charset=utf-8")
+        self.assets["/view"] = ((web_dir / "view.html").read_bytes(), "text/html; charset=utf-8")
+        self.assets["/view.js"] = ((web_dir / "view.js").read_bytes(), "text/javascript; charset=utf-8")
+        self.assets["/live-metrics.js"] = ((web_dir / "live-metrics.js").read_bytes(), "text/javascript; charset=utf-8")
+        self.assets["/history-chart.js"] = ((web_dir / "history-chart.js").read_bytes(), "text/javascript; charset=utf-8")
+        self.assets["/select-menu.js"] = ((web_dir / "select-menu.js").read_bytes(), "text/javascript; charset=utf-8")
         super().__init__(address, Handler)
         host = f"127.0.0.1:{self.server_port}"
         self.origins = {host: "http://" + host}
@@ -378,17 +377,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def token(self):
         try:
-            name = "neb_devfee_sid" if self.server.owner is not None else "neb_sid"
-            session = SimpleCookie(self.headers.get("Cookie", "")).get(name)
+            session = SimpleCookie(self.headers.get("Cookie", "")).get("neb_sid")
             return session.value if session else None
         except CookieError:
             return None
 
     def cookie(self, token, age):
         secure = "; Secure" if self.origin().startswith("https://") else ""
-        name = "neb_devfee_sid" if self.server.owner is not None else "neb_sid"
-        path = "/devfee/" if self.server.owner is not None and secure else "/"
-        return f"{name}={token}; Path={path}; Max-Age={age}; HttpOnly; SameSite=Strict{secure}"
+        return f"neb_sid={token}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}"
 
     def do_GET(self):
         if self.origin() is None:
@@ -400,24 +396,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == "/favicon.ico":
             return self.respond(204, b"")
         try:
-            owner = self.server.owner
-            if owner is not None and path.path == "/policy":
-                if self.server.owner_enrollment:
-                    return self.fail(404, "Политика недоступна в режиме привязки 2FA.")
-                return self.respond(200, owner.status())
             if path.path == "/api/auth/info":
-                info = {"totp": self.server.auth.is_totp_enabled()}
-                if owner is not None:
-                    info["enrollment"] = self.server.owner_enrollment
-                return self.respond(200, info)
-            if owner is None and path.path == "/api/public/status":
+                return self.respond(200, {"totp": self.server.auth.is_totp_enabled()})
+            if path.path == "/api/public/status":
                 return self.respond(200, self.server.service.public_status())
             if not self.server.auth.valid(self.token()):
                 return self.fail(401, "Войдите в панель.")
-            if owner is not None:
-                if not self.server.owner_enrollment and path.path == "/api/devfee":
-                    return self.respond(200, owner.status())
-                return self.fail(404, "Страница не найдена.")
             service = self.server.service
             if path.path == "/api/status":
                 return self.respond(200, service.status())
@@ -434,7 +418,9 @@ class Handler(BaseHTTPRequestHandler):
             if path.path == "/api/wallets" and service.wallets:
                 return self.respond(200, service.wallets.status())
             if path.path == "/api/releases" and service.releases:
-                return self.respond(200, service.releases.status())
+                if path.query not in ("", "check=0"):
+                    return self.fail(400, "Неизвестный режим проверки релизов.")
+                return self.respond(200, service.releases.status(service.config, check=not path.query))
             if path.path == "/api/fleet" and service.fleet:
                 return self.respond(200, service.fleet.list())
             if path.path == "/api/history":
@@ -466,7 +452,7 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         try:
             if is_node:
-                if self.server.owner is not None or not service.fleet or self.headers.get("Cookie"):
+                if not service.fleet or self.headers.get("Cookie"):
                     return self.fail(403, "Подключение ноды недоступно.")
                 if self.path.endswith("/pair"):
                     reply = service.fleet.pair(body.get("id"),body.get("code"),body.get("key"))
@@ -484,11 +470,6 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/logout":
                 auth.revoke(token)
                 return self.respond(200, {"ok": True}, cookie=self.cookie("", 0))
-            if self.server.owner is not None:
-                if not self.server.owner_enrollment and self.path == "/api/devfee" and set(body) == {"paused"}:
-                    return self.respond(200, self.server.owner.set_paused(body["paused"]))
-                if not self.server.owner_enrollment or self.path not in ("/api/auth/totp/begin", "/api/auth/totp/confirm"):
-                    return self.fail(404, "Действие не найдено.")
             if self.path == "/api/auth/totp/begin":
                 return self.respond(200, auth.begin_enrollment(token,body.get("password")))
             if self.path == "/api/auth/totp/confirm":
@@ -511,6 +492,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200,service.wallets.create(body.get("label"),body.get("password")))
             if self.path == "/api/wallets/export" and service.wallets:
                 return self.respond(200,service.wallets.export(body.get("id"),body.get("password")))
+            if self.path == "/api/releases/channel" and service.releases:
+                if set(body) != {"channel"}:
+                    return self.fail(400, "Ожидается только канал обновлений.")
+                return self.respond(200, service.releases.set_channel(service.config, body["channel"]))
             if self.path == "/api/network/refresh":
                 return self.respond(200, service.network_status(refresh=True))
             if service.fleet:
