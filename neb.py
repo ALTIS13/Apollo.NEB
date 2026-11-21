@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -23,18 +24,21 @@ VERSION = "0.6.0"
 
 
 def private(path):
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute() or path != path.resolve() or path in (Path.home(), *Path.home().parents):
         raise ValueError("Укажите абсолютный путь к приватному каталогу, не ссылку.")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.stat().st_uid != os.geteuid():
-        raise ValueError("Приватный каталог должен принадлежать текущему пользователю.")
-    path.chmod(0o700)
+    meta = path.stat()
+    if meta.st_uid != os.geteuid() or not stat.S_ISDIR(meta.st_mode) or meta.st_mode & 0o077:
+        raise ValueError("Нужен отдельный каталог текущего пользователя с правами 0700. Существующие права не изменены.")
     return path
 
 
 def paths(args):
     cfg = args.config_dir or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "apollo-neb"
     state = args.state_dir or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "apollo-neb"
+    if (not cfg.is_absolute() or not state.is_absolute() or cfg != cfg.resolve() or state != state.resolve()
+            or cfg == state or cfg in state.parents or state in cfg.parents):
+        raise ValueError("Каталоги настроек и состояния должны быть отдельными абсолютными путями без ссылок.")
     return cfg, state
 
 
@@ -44,8 +48,6 @@ def settings_path(cfg):
 
 def configure(args):
     cfg, state = paths(args)
-    if cfg == state:
-        raise ValueError("Каталоги настроек и состояния должны быть разными.")
     with lock_state(private(state)):
         configure_locked(args, cfg, state)
 
@@ -70,7 +72,9 @@ def configure_locked(args, cfg, state):
     elif args.support_wallet or args.support_bps is not None or args.accept_support:
         if args.accept_support is not True:
             raise ValueError("Укажите получателя, долю и явное согласие --accept-support; см. --help.")
-        support = {"enabled": True, "wallet": args.support_wallet, "basis_points": args.support_bps}
+        recommendation = core.read(HERE / "developer-support.json", {})
+        support = {"enabled": True, "wallet": args.support_wallet or recommendation.get("wallet"),
+                   "basis_points": args.support_bps if args.support_bps is not None else recommendation.get("basis_points")}
     checked_support = core.support_config(support)
     if checked_support["enabled"] and checked_support["wallet"] == profile["wallet"]:
         raise ValueError("Адрес поддержки и адрес добычи не могут совпадать.")

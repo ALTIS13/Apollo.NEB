@@ -20,8 +20,10 @@ class ExampleWorker:
                  "state": "running" if self.running else "stopped", "edge": None, "hot": None,
                  "hbm": None, "watts": None, "rate_hs": 1500000 if self.running else None}]
 
-    def start(self, id_, profile, *, limits):
+    def start(self, id_, profile, *, limits, max_seconds=None):
         self.calls.append(("start", id_, profile["wallet"]))
+        if max_seconds is not None:
+            self.support_window = max_seconds
         self.running = True
 
     def stop(self, id_):
@@ -108,8 +110,26 @@ class ServerTests(unittest.TestCase):
         with patch("neb_app.time.monotonic", return_value=10):
             self.service.poll()
         self.assertEqual(self.service.status()["support"]["active_workers"], ["gpu"])
+        self.assertEqual(self.runtime.support_window, 3)
         with patch("neb_app.time.monotonic", return_value=13.1):
             self.service.poll()
         self.assertEqual(self.runtime.calls, [("start","gpu",OWNER), ("stop","gpu"),
                                               ("start","gpu",SUPPORT), ("stop","gpu"), ("start","gpu",OWNER)])
         self.assertFalse(self.service.status()["support"]["active_workers"])
+
+    def test_expired_support_returns_to_operator_before_credit_checkpoint(self):
+        self.service.clock = core.SupportClock(core.support_config(
+            {"enabled": True, "wallet": SUPPORT, "basis_points": 50}), self.base / "credit.json", window=3)
+        self.service.change("start", {"id":"gpu"})
+        self.service.clock.credit["gpu"] = 3
+        with patch("neb_app.time.monotonic", return_value=10):
+            self.service.poll()
+        original = self.runtime.snapshot
+        self.runtime.snapshot = lambda limits: [
+            {**original(limits)[0], "id": "other", "state": "running"},
+            {**original(limits)[0], "state": "stopped", "exit_reason": "time-limit"}]
+        with patch("neb_app.time.monotonic", return_value=100), patch.object(
+                self.service.clock, "flush", side_effect=OSError("Disk full")), self.assertRaises(OSError):
+            self.service.poll()
+        self.assertEqual(self.runtime.calls[-2:], [("stop", "gpu"), ("start", "gpu", OWNER)])
+        self.assertEqual(self.service.clock.active(), [])

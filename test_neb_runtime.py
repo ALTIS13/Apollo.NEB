@@ -17,16 +17,17 @@ GPU = "0000:04:00.0"
 
 class WorkerConfigTests(unittest.TestCase):
     def test_rejects_untrusted_fields_and_bad_templates(self):
-        base = {"id": "a", "adapter": "custom", "binary": "/bin/false", "args": []}
+        base = {"id": "a", "adapter": "custom", "binary": "/bin/false", "args": ["{wallet}", "{pool}"]}
         for mutation in ({"binary": "miner"}, {"id": "../a"}, {"password": "no"},
                          {"args": ["{wallet.__class__}"]}, {"args": ["{wallet!r}"]},
-                         {"device": GPU, "args": ["--device=0"]}, {"device_index": 0}):
+                         {"args": ["{wallet}"]}, {"args": ["{pool}"]},
+                         {"device": GPU, "args": ["{wallet}", "{pool}", "--device=0"]}, {"device_index": 0}):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 runtime.validate_workers([{**base, **mutation}])
-        self.assertEqual(runtime.validate_workers([{**base, "args": ["--id={worker}"]}])[0]["label"], "a")
+        self.assertEqual(runtime.validate_workers([{**base, "args": ["{wallet}", "{pool}", "--id={worker}"]}])[0]["label"], "a")
 
     def test_rejects_duplicate_worker_ids_or_gpu_bindings(self):
-        base = {"id": "a", "adapter": "custom", "binary": "/bin/false", "args": ["{device}"]}
+        base = {"id": "a", "adapter": "custom", "binary": "/bin/false", "args": ["{wallet}", "{pool}", "{device}"]}
         for workers in ([base, base], [{**base, "device": GPU}, {**base, "id": "b", "device": GPU}]):
             with self.assertRaises(ValueError):
                 runtime.validate_workers(workers)
@@ -72,8 +73,11 @@ class RuntimeTests(unittest.TestCase):
         exe = self.root / "fake miner"
         exe.write_text(f"#!{Path(sys.executable).resolve()}\n{body}\n", encoding="utf-8")
         exe.chmod(0o700)
+        opts = {"args": ["{wallet}", "{pool}"], **options}
+        if opts["args"] == ["{device}"]:
+            opts["args"] += ["{wallet}", "{pool}"]
         manager = runtime.Manager(
-            [{"id": "test", "adapter": "custom", "binary": str(exe), "args": [], **options}],
+            [{"id": "test", "adapter": "custom", "binary": str(exe), **opts}],
             self.root / "state",
         )
         self.addCleanup(manager.close)
@@ -113,6 +117,59 @@ class RuntimeTests(unittest.TestCase):
             manager.start("test", {**PROFILE, "pool": "stratum+tcp://user:not-allowed@example.invalid:3412"})
         self.assertNotIn("not-allowed", str(caught.exception))
         self.assertNotEqual(manager.snapshot({})[0]["state"], "running")
+
+    def test_pidfd_unavailable_prevents_launch(self):
+        manager = self.manager()
+        with patch.object(runtime.os, "pidfd_open", side_effect=OSError("unavailable")):
+            with self.assertRaises(ValueError):
+                manager.start("test", PROFILE)
+        self.assertEqual(manager.snapshot({})[0]["state"], "blocked")
+
+    def test_max_seconds_stops_miner_without_panel_polling(self):
+        started, lingered = self.root / "leased", self.root / "late"
+        manager = self.manager(
+            "import time\nfrom pathlib import Path\n"
+            f"Path({str(started)!r}).touch()\ntime.sleep(0.9)\nPath({str(lingered)!r}).touch()\n"
+            "while True: time.sleep(0.02)"
+        )
+        manager.start("test", PROFILE, max_seconds=0.4)
+        time.sleep(1.0)
+        self.assertTrue(started.exists())
+        self.assertFalse(lingered.exists())
+        expired = manager.snapshot({})[0]
+        self.assertEqual(expired["state"], "stopped")
+        self.assertEqual(expired["exit_reason"], "time-limit")
+        self.assertTrue(any(e["type"] == "exit" and e["status"] == "expired" for e in manager.drain_events()))
+        manager.start("test", PROFILE)
+        self.assertIsNone(manager.snapshot({})[0].get("exit_reason"))
+        manager.stop("test")
+        self.assertIsNone(manager.snapshot({})[0].get("exit_reason"))
+
+    def test_sigkill_of_panel_kills_its_owned_miner_without_shutdown(self):
+        started, lingered = self.root / "launched", self.root / "orphan"
+        exe = self.root / "owned-miner"
+        exe.write_text(f"#!{Path(sys.executable).resolve()}\n"
+                       "import time\nfrom pathlib import Path\n"
+                       f"Path({str(started)!r}).touch()\ntime.sleep(0.9)\nPath({str(lingered)!r}).touch()\n")
+        exe.chmod(0o700)
+        command = ("import time; from pathlib import Path; from neb_runtime import Manager; "
+                   f"m=Manager([dict(id='test',adapter='custom',binary={str(exe)!r},args=['{{wallet}}','{{pool}}'])],"
+                   f"Path({str(self.root / 'worker-state')!r})); m.start('test',{PROFILE!r}); time.sleep(10)")
+        parent = subprocess.Popen([sys.executable, "-c", command], cwd=Path(runtime.__file__).parent)
+        try:
+            for _ in range(100):
+                if started.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(started.exists())
+            parent.kill()
+            parent.wait(timeout=3)
+            time.sleep(1.0)
+            self.assertFalse(lingered.exists())
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=3)
 
     def test_exiting_leader_cleans_owned_group_not_unrelated_process(self):
         appeared = self.root / "child-alive"
@@ -158,7 +215,43 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(manager.snapshot({})[0]["state"], "protection")
             card["edge"] = 60
             self.assertEqual(manager.snapshot({})[0]["state"], "protection")
-            self.assertTrue(any(event["type"] == "thermal" for event in manager.drain_events()))
+            self.assertTrue(any(event["type"] == "thermal" and event["status"] == "stopped"
+                                for event in manager.drain_events()))
+
+    def test_thermal_signals_all_cards_before_first_wait_and_exposes_unconfirmed_stop(self):
+        other = "0000:05:00.0"
+        cards = [dict(device=bdf, vendor="amd", edge=60, hot=75) for bdf in (GPU, other)]
+        mine = self.root / "two-worker-fixture"
+        mine.write_text(f"#!{Path(sys.executable).resolve()}\nimport time\nwhile True: time.sleep(0.02)\n")
+        mine.chmod(0o700)
+        manager = runtime.Manager([
+            dict(id=label, adapter="custom", binary=str(mine), device=card["device"],
+                 args=["{device}", "{wallet}", "{pool}"])
+            for label, card in zip(("first", "second"), cards)], self.root / "two")
+        self.addCleanup(manager.close)
+        with patch.object(runtime, "discover_devices", side_effect=lambda: [dict(card) for card in cards]):
+            for label in ("first", "second"):
+                manager.start(label, PROFILE)
+            first, second = manager._live["first"], manager._live["second"]
+            order = []
+            second_signal = second._signal
+
+            def signal_second(signum):
+                order.append("signal-second")
+                second_signal(signum)
+
+            def wait_first(*_args, **_kwargs):
+                order.append("wait-first")
+                raise RuntimeError("simulated kernel-stalled child")
+
+            for card in cards:
+                card["edge"] = 81
+            with patch.object(first, "stop", side_effect=wait_first), patch.object(second, "_signal", side_effect=signal_second):
+                states = [row["state"] for row in manager.snapshot({})]
+            self.assertEqual(order[0], "signal-second")
+            self.assertEqual(states, ["protection", "protection"])
+            thermal = {e["worker"]: e["status"] for e in manager.drain_events() if e["type"] == "thermal"}
+            self.assertEqual(thermal, {"first": "unconfirmed", "second": "stopped"})
 
     def test_replaced_gpu_at_same_pci_address_triggers_protection(self):
         card = {"device": GPU, "vendor": "amd", "_identity": (12, "amdgpu"), "edge": 50,

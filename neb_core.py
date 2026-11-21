@@ -149,10 +149,12 @@ class SupportClock:
             return "operator" if now >= self.deadline[id_] else None
         if running and was_running and 0 <= now - last <= 5:
             self.credit[id_] = min(2 * self.window, self.credit.get(id_, 0.) + (now - last) * self.exchange)
-        if now - self.flushed_at >= 60:
+        return "support" if running and self.credit.get(id_, 0.) + 1e-7 >= self.window else None
+
+    def checkpoint(self, now):
+        if self.cfg["enabled"] and now - self.flushed_at >= 60:
             self.flush()
             self.flushed_at = now
-        return "support" if running and self.credit.get(id_, 0.) + 1e-7 >= self.window else None
 
     def fund(self, id_, now):
         self.credit[id_] = max(0., self.credit[id_] - self.window)

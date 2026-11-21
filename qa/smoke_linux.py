@@ -58,6 +58,14 @@ def test(directory):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     password = secrets.token_urlsafe(24)
+    shared = directory / "existing-shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    refused = subprocess.run(["python3", "-I", str(SOURCE / "neb.py"), "--config-dir", str(config),
+                              "--state-dir", str(shared), "configure", "--password-stdin"],
+                             input=password + "\n", text=True, capture_output=True, timeout=5)
+    assert refused.returncode != 0 and shared.stat().st_mode & 0o777 == 0o755
+    assert not (shared / "service.lock").exists() and not config.exists()
     subprocess.run(["/bin/sh", str(SOURCE / "install.sh"), "--prefix", str(prefix),
                     "--config-dir", str(config), "--state-dir", str(state), "--",
                     "--wallet", SYNTHETIC_NEVER_PAID, "--workers", str(workers),
@@ -95,6 +103,15 @@ def test(directory):
     finally:
         service.terminate()
         service.wait(timeout=10)
+    recommendation = json.loads((SOURCE / "developer-support.json").read_text(encoding="utf-8"))
+    assert not json.loads((config / "settings.json").read_text(encoding="utf-8"))["support"]["enabled"]
+    opts = [str(launcher), "--config-dir", str(config), "--state-dir", str(state), "configure"]
+    subprocess.run([*opts, "--accept-support"], text=True, check=True, timeout=5,
+                   capture_output=True)
+    accepted = json.loads((config / "settings.json").read_text(encoding="utf-8"))["support"]
+    assert accepted == {"enabled": True, "basis_points": 50, "wallet": recommendation["wallet"]}
+    subprocess.run([*opts, "--disable-support"], text=True, check=True, timeout=5,
+                   capture_output=True)
     print("PASS: fresh Linux install, auth, isolated offline worker, telemetry, start/stop and logout.")
 
 

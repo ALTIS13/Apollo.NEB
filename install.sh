@@ -3,6 +3,8 @@ set -eu
 umask 077
 src=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 neb_prefix="$HOME/.local"
+neb_cfg=
+neb_state=
 service=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -31,7 +33,8 @@ fi
 test "$(id -u)" -ne 0 || { printf '%s\n' 'Run as a dedicated regular Linux user, without sudo.' >&2; exit 1; }
 case "$neb_prefix" in /*) ;; *) printf 'Prefix must be absolute.\n' >&2; exit 2;; esac
 case "${neb_cfg:-/}:${neb_state:-/}" in /*:/*) ;; *) printf 'Configuration and state paths must be absolute.\n' >&2; exit 2;; esac
-python3 -c 'import sys; assert sys.version_info >= (3,10), "Python 3.10+ required"; assert sys.platform == "linux"'
+python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) and sys.platform == "linux" else "Linux with Python 3.10+ is required.")'
+python3 -I "$src/neb_install_check.py" "$neb_prefix" "$HOME" "$service"
 if [ "$service" -eq 1 ]; then
   test "$neb_prefix" = "$HOME/.local" && test -z "${neb_cfg:-}${neb_state:-}" &&
     test -z "${XDG_CONFIG_HOME:-}${XDG_STATE_HOME:-}" || {
@@ -45,15 +48,14 @@ fi
 if [ -n "${neb_state:-}" ]; then set -- --state-dir "$neb_state" configure "$@"; else set -- configure "$@"; fi
 if [ -n "${neb_cfg:-}" ]; then set -- --config-dir "$neb_cfg" "$@"; fi
 base="$neb_prefix/lib/apollo-neb"
-install -d -m0700 "$base"
-mkdir -p -- "$neb_prefix/bin"
+mkdir -p -- "$base" "$neb_prefix/bin"
 release=$(mktemp -d "$base/release.XXXXXXXX")
 install -d -m0700 "$release/web"
-install -m0600 "$src/neb.py" "$src/neb_core.py" "$src/neb_app.py" "$src/neb_history.py" "$src/neb_runtime.py" "$release/"
+install -m0600 "$src/neb.py" "$src/neb_core.py" "$src/neb_app.py" "$src/neb_history.py" "$src/neb_runtime.py" "$src/developer-support.json" "$release/"
 install -m0600 "$src/web/index.html" "$src/web/ui.js" "$src/web/ui.css" "$release/web/"
 if ! python3 -I "$release/neb.py" "$@"; then
   rm -- "$release/neb.py" "$release/neb_core.py" "$release/neb_app.py" "$release/neb_history.py" "$release/neb_runtime.py" \
-    "$release/web/index.html" "$release/web/ui.js" "$release/web/ui.css"
+    "$release/developer-support.json" "$release/web/index.html" "$release/web/ui.js" "$release/web/ui.css"
   rmdir -- "$release/web"
   # Python bytecode, if created, is disposable and inside the failed stage.
   if [ -d "$release/__pycache__" ]; then
@@ -63,13 +65,17 @@ if ! python3 -I "$release/neb.py" "$@"; then
   rmdir -- "$release"
   exit 1
 fi
-install -m0700 "$src/apollo-neb" "$neb_prefix/bin/apollo-neb"
+if [ ! -e "$neb_prefix/bin/apollo-neb" ]; then
+  install -m0700 "$src/apollo-neb" "$neb_prefix/bin/apollo-neb"
+fi
 ln -s "$(basename "$release")" "$release/.switch"
 mv -Tf -- "$release/.switch" "$base/current"
 if [ "$service" -eq 1 ]; then
   unitdir="$HOME/.config/systemd/user"
-  install -d "$unitdir"
-  install -m0644 "$src/apollo-neb.service" "$unitdir/apollo-neb.service"
+  mkdir -p -- "$unitdir"
+  if [ ! -e "$unitdir/apollo-neb.service" ]; then
+    install -m0644 "$src/apollo-neb.service" "$unitdir/apollo-neb.service"
+  fi
   systemctl --user daemon-reload
   systemctl --user enable --now apollo-neb.service
   systemctl --user is-active --quiet apollo-neb.service

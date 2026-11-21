@@ -88,6 +88,8 @@ def validate_workers(raw: list) -> list[dict]:
             names.update(PLACEHOLDER.findall(arg))
         if adapter == "custom" and ((bdf is None) == ("device" in names)):
             raise Refusal("A custom GPU worker must explicitly select its PCI address with {device}.")
+        if adapter == "custom" and not {"wallet", "pool"} <= names:
+            raise Refusal("A custom worker must pass both {wallet} and {pool} to its executable.")
         if "dataset" in names and dataset is None:
             raise Refusal("The dataset placeholder requires an explicit dataset path.")
         workers.append(dict(id=ident, label=label, adapter=adapter, binary=binary, dataset=dataset,
@@ -410,11 +412,111 @@ def _metrics(line, log_format):
     return {}
 
 
+def _parent_pidfd():
+    fd = None
+    try:
+        fd = os.pidfd_open(os.getpid())
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_READ)
+            if selector.select(0):
+                raise OSError
+        return fd
+    except (AttributeError, OSError):
+        if fd is not None:
+            os.close(fd)
+        raise Refusal("A usable Linux pidfd (kernel 5.3 or later) is required to supervise a miner.") from None
+
+
+def _kill_owned_group(group, signum=None):
+    try:
+        os.killpg(group, signal.SIGKILL if signum is None else signum)
+    except ProcessLookupError:
+        pass
+
+
+def _guard_miner(pidfd, status_fd, deadline, argv):
+    # This interpreter, the miner and its descendants share a new group created
+    # by the dashboard. Signal that group only, never an externally supplied PID.
+    if os.getpid() != os.getpgid(0) or os.getpid() != os.getsid(0):
+        return
+    group = os.getpid()
+    terminated = False
+
+    def stop(_signum, _frame):
+        nonlocal terminated
+        terminated = True
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(pidfd, selectors.EVENT_READ)
+            if terminated or selector.select(0) or (deadline and time.monotonic() >= deadline):
+                return
+            miner = subprocess.Popen(argv, stdin=subprocess.DEVNULL, close_fds=True)
+            os.write(status_fd, b"S")
+            while True:
+                if terminated or selector.select(0):
+                    return
+                result = miner.poll()
+                if result is not None:
+                    os.write(status_fd, b"0" if result == 0 else b"1")
+                    return
+                left = deadline - time.monotonic() if deadline else 0.05
+                if left <= 0:
+                    os.write(status_fd, b"E")
+                    return
+                if selector.select(min(left, 0.05)):
+                    return
+    except OSError:
+        pass
+    finally:
+        _kill_owned_group(group)
+
+
+def _spawn_guard(argv, cwd, env, capture, deadline):
+    pidfd = _parent_pidfd()
+    read_fd = write_fd = None
+    proc = None
+    transferred = False
+    try:
+        read_fd, write_fd = os.pipe()
+        guard_argv = [sys.executable, "-I", str(Path(__file__).resolve()), "--guard-miner",
+                      str(pidfd), str(write_fd), str(deadline), *argv]
+        proc = subprocess.Popen(guard_argv, cwd=cwd, env=env, start_new_session=True,
+                                pass_fds=(pidfd, write_fd), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE if capture else subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        os.close(write_fd)
+        write_fd = None
+        with selectors.DefaultSelector() as selector:
+            selector.register(read_fd, selectors.EVENT_READ)
+            if not selector.select(2) or os.read(read_fd, 1) != b"S":
+                raise OSError("No successful launch acknowledgement.")
+        os.set_blocking(read_fd, False)
+        transferred = True
+        return proc, read_fd
+    finally:
+        os.close(pidfd)
+        if write_fd is not None:
+            os.close(write_fd)
+        if not transferred:
+            if read_fd is not None:
+                os.close(read_fd)
+            if proc is not None:
+                _kill_owned_group(proc.pid)
+                if proc.stdout:
+                    proc.stdout.close()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass  # The still-owned group has received SIGKILL; no restart was accepted.
+
+
 @dataclass
 class _Child:
     proc: subprocess.Popen
     log_format: str
     card: dict | None
+    status_fd: int
     end_read: threading.Event = field(default_factory=threading.Event)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     stats: dict = field(default_factory=dict)
@@ -452,7 +554,7 @@ class _Child:
         # until every group signal has been sent, including after natural leader exit.
         return os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
-    def stop(self, graceful):
+    def stop(self, graceful, *, timeout=2, join=True):
         if graceful:
             self._signal(signal.SIGTERM)
             deadline = time.monotonic() + 0.25
@@ -460,19 +562,21 @@ class _Child:
                 time.sleep(0.01)
         self._signal(signal.SIGKILL)
         try:
-            code = self.proc.wait(timeout=2)
+            self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             raise RuntimeError("The worker process has not stopped.") from None
         self.end_read.set()
-        if self.thread:
+        if self.thread and join:
             self.thread.join(timeout=0.5)
-        return code
+        try:
+            return os.read(self.status_fd, 1)
+        except BlockingIOError:
+            return b""
+        finally:
+            os.close(self.status_fd)
 
     def _signal(self, signum):
-        try:
-            os.killpg(self.proc.pid, signum)
-        except ProcessLookupError:
-            pass
+        _kill_owned_group(self.proc.pid, signum)
 
 
 class Manager:
@@ -482,6 +586,7 @@ class Manager:
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._state = {ident: ("stopped", "Stopped.") for ident in self._workers}
         self._live = {}
+        self._expired = set()
         self._events = deque(maxlen=1024)
         self._lock = threading.RLock()
         self._limits = _limits({})
@@ -501,14 +606,19 @@ class Manager:
             result = child.stop(graceful=False)
             del self._live[ident]
             if self._state[ident][0] == "protection":
-                self._state[ident] = ("protection", "Thermal cut-off completed.")
+                detail = "Thermal cut-off completed."
+                self._state[ident] = ("protection", detail)
+                self._event("thermal", ident, detail, "stopped")
                 return
-            status = "stopped" if result == 0 else "failed"
-            detail = f"Miner exited ({result})."
+            status = "stopped" if result in {b"0", b"E"} else "failed"
+            detail = "Maximum worker runtime elapsed." if result == b"E" else (
+                "Miner exited normally." if result == b"0" else "Miner or its watchdog exited unexpectedly.")
             self._state[ident] = (status, detail)
-            self._event("exit", ident, detail, status)
+            if result == b"E":
+                self._expired.add(ident)
+            self._event("exit", ident, detail, "expired" if result == b"E" else status)
 
-    def start(self, worker_id, profile: dict, *, limits: dict | None = None):
+    def start(self, worker_id, profile: dict, *, limits: dict | None = None, max_seconds: float | None = None):
         with self._lock:
             worker = self._worker(worker_id)
             if self._closed:
@@ -516,11 +626,15 @@ class Manager:
             self._exit_if_finished(worker_id)
             if worker_id in self._live:
                 raise Refusal("Worker is already running.")
+            self._expired.discard(worker_id)
             try:
                 if sys.platform != "linux":
                     raise Refusal("Worker execution requires Linux.")
                 if limits is not None:
                     self._limits = _limits(limits)
+                if max_seconds is not None and (type(max_seconds) not in {int, float} or
+                        _number(max_seconds, 86400, 0.01) is None):
+                    raise Refusal("Invalid maximum worker runtime.")
                 profile = _profile(profile, worker["adapter"])
                 binary = _trusted_file(worker["binary"], executable=True)
                 card = None
@@ -533,16 +647,15 @@ class Manager:
                 argv = _argv(worker, profile, binary, card, env)
                 cwd = self._state_dir / worker_id
                 cwd.mkdir(exist_ok=True, mode=0o700)
-                proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True, stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE if worker["log_format"] != "none" else subprocess.DEVNULL,
-                                        stderr=subprocess.STDOUT)
+                deadline = time.monotonic() + max_seconds if max_seconds is not None else 0
+                proc, status_fd = _spawn_guard(argv, cwd, env, worker["log_format"] != "none", deadline)
             except Refusal as exc:
                 self._state[worker_id] = ("blocked", str(exc))
                 raise
             except OSError:
                 self._state[worker_id] = ("failed", "Configured miner could not start.")
                 raise RuntimeError("Configured miner could not start.") from None
-            child = _Child(proc, worker["log_format"], card)
+            child = _Child(proc, worker["log_format"], card, status_fd)
             self._live[worker_id] = child
             if proc.stdout:
                 child.thread = threading.Thread(target=child.observe, daemon=True)
@@ -569,40 +682,58 @@ class Manager:
             self._worker(worker_id)
             self._exit_if_finished(worker_id)
             self._stop(worker_id, "stop", "Stopped by request.", "stopped")
+            self._expired.discard(worker_id)
 
     def snapshot(self, limits: dict) -> list[dict]:
         with self._lock:
             self._limits = _limits(limits)
             cards = ({row["device"]: row for row in discover_devices()}
                      if any(w["device"] is not None for w in self._workers.values()) else {})
-            result = []
-            for ident, worker in self._workers.items():
-                self._exit_if_finished(ident)
-                child, card = self._live.get(ident), cards.get(worker["device"])
-                if child and worker["device"] is not None:
+            unsafe = {}
+            # Signal every unsafe group before waiting for any one driver or process.
+            for ident, child in self._live.items():
+                device = self._workers[ident]["device"]
+                if device is None or child.finished():
+                    continue
+                card = cards.get(device)
+                if self._state[ident][0] == "protection":
+                    reason = "Thermal cut-off completed."
+                else:
                     identity = ("vendor", "_uuid", "_identity")
                     required = tuple(metric for metric in ("hot", "hbm") if child.card.get(metric) is not None
                                      and self._limits[f"{metric}_limit"] is not None)
                     changed = card and any(card.get(key) != child.card.get(key) for key in identity)
                     reason = "GPU mapping changed while mining." if changed else _thermal(card, self._limits, required)
-                    if reason:
-                        try:
-                            self._stop(ident, "thermal", reason, "protection")
-                        except RuntimeError:
-                            # Keep ownership and continue monitoring other workers if a
-                            # driver-stalled process has not acknowledged SIGKILL yet.
-                            if self._state[ident][0] != "protection":
-                                self._event("thermal", ident, reason, "protection")
-                            self._state[ident] = ("protection", "Thermal cut-off requested; worker has not exited.")
-                        child = None
+                if reason:
+                    child._signal(signal.SIGKILL)
+                    unsafe[ident] = reason
+            cutoff = time.monotonic() + 0.25
+            for ident, reason in unsafe.items():
+                try:
+                    self._live[ident].stop(graceful=False, timeout=max(0, cutoff - time.monotonic()), join=False)
+                except RuntimeError:
+                    if self._state[ident][0] != "protection":
+                        self._event("thermal", ident, reason, "unconfirmed")
+                    self._state[ident] = ("protection", "Thermal cut-off requested; worker has not exited.")
+                else:
+                    del self._live[ident]
+                    self._state[ident] = ("protection", reason)
+                    self._event("thermal", ident, reason, "stopped")
+
+            result = []
+            for ident, worker in self._workers.items():
+                if ident not in unsafe:
+                    self._exit_if_finished(ident)
+                child, card = self._live.get(ident), cards.get(worker["device"])
                 status, message = self._state[ident]
                 stats = dict.fromkeys(("rate_hs", "accepted", "rejected"))
-                if child:
+                if child and status == "running":
                     with child.stats_lock:
                         stats.update({key: value for key, (value, stamp) in child.stats.items()
                                       if key != "rate_hs" or time.monotonic() - stamp <= 30})
                 result.append(dict(id=ident, label=worker["label"], adapter=worker["adapter"],
                                    device=worker["device"], state=status, message=message,
+                                   exit_reason="time-limit" if ident in self._expired else None,
                                    **{metric: (card or {}).get(metric) for metric in METRICS}, **stats))
             return result
 
@@ -625,5 +756,8 @@ class Manager:
                 raise RuntimeError("One or more owned workers have not stopped.")
 
 
-if __name__ == "__main__" and sys.argv[1:] == ["--probe-opencl"]:
-    print(json.dumps(_probe_opencl()))
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--probe-opencl"]:
+        print(json.dumps(_probe_opencl()))
+    elif len(sys.argv) >= 6 and sys.argv[1] == "--guard-miner":
+        _guard_miner(int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), sys.argv[5:])

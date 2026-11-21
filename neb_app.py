@@ -42,9 +42,10 @@ class Service:
         self.archive.tick(at, self.rows, pending)
         self.events = []
 
-    def launch(self, id_, address):
+    def launch(self, id_, address, **options):
         pool = self.pools[self.profile["pool"]]["url"]
-        self.runtime.start(id_, {**self.profile, "wallet": core.wallet(address), "pool": pool}, limits=self.limits)
+        self.runtime.start(id_, {**self.profile, "wallet": core.wallet(address), "pool": pool},
+                           limits=self.limits, **options)
 
     def change(self, command, body):
         with self.lock:
@@ -80,7 +81,12 @@ class Service:
 
     def switch_wallet(self, id_, mode, now):
         if mode == "support":
-            self.clock.fund(id_, now)
+            try:
+                self.clock.fund(id_, now)
+            except OSError:
+                self.suspended_support.add(id_)
+                self.add_event("support", id_, "Резерв времени не сохранён. Адрес не менялся.", "failed")
+                return
         try:
             self.runtime.stop(id_)
         except (RuntimeError, ValueError, OSError):
@@ -95,7 +101,16 @@ class Service:
             self.clock.finish(id_)
         address = self.clock.cfg["wallet"] if mode == "support" else self.profile["wallet"]
         try:
-            self.launch(id_, address)
+            if mode == "support":
+                left = self.clock.deadline[id_] - time.monotonic()
+                if left <= 1:
+                    self.clock.finish(id_)
+                    self.launch(id_, self.profile["wallet"])
+                    self.add_event("support", id_, "Окно поддержки истекло до запуска.", "ended")
+                    return
+                self.launch(id_, address, max_seconds=left)
+            else:
+                self.launch(id_, address)
             self.add_event("support", id_, "Начата сессия поддержки автора." if mode == "support"
                            else "Возврат к адресу оператора.", "started")
         except (RuntimeError, ValueError, OSError):
@@ -108,12 +123,21 @@ class Service:
             self.rows = self.runtime.snapshot(self.limits)
             changed = False
             monotonic = time.monotonic()
-            for row in self.rows:
+            rows = sorted(self.rows, key=lambda row: row["id"] not in self.clock.deadline)
+            for row in rows:
                 id_, running = row["id"], row["state"] == "running"
-                if not running and id_ in self.clock.deadline:
+                ended_by_timer = row.get("exit_reason") == "time-limit" and row["state"] == "stopped"
+                if ended_by_timer and id_ in self.clock.deadline and id_ not in self.suspended_support:
+                    self.switch_wallet(id_, "operator", monotonic)
+                    changed = True
+                    continue
+                if not running and id_ in self.clock.deadline and row["state"] not in ("protection",):
                     self.clock.finish(id_)
                     self.suspended_support.add(id_)
                     self.add_event("support", id_, "Сессия поддержки завершилась без перезапуска.", "ended")
+                if row["state"] == "protection" and id_ in self.clock.deadline:
+                    # On thermal failure only verify/stop; never restart automatically.
+                    self.suspended_support.add(id_)
                 # Custom binaries may not follow the Suprnova payout contract.
                 compatible = row["adapter"] in ("suprminer-opencl", "suprminer-cuda")
                 target = self.clock.observe(id_, running and compatible, monotonic)
@@ -134,6 +158,7 @@ class Service:
             at = int(time.time() if now is None else now)
             self.persist(at)
             self.last = at
+            self.clock.checkpoint(monotonic)
 
     def loop(self):
         while not self.stopping.is_set():
@@ -171,11 +196,13 @@ def validated_origin(origin):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 32
 
     def __init__(self, address, service, auth, web_dir, origin):
         if address[0] != "127.0.0.1":
             raise ValueError("Прямой доступ разрешён только с loopback.")
         self.service, self.auth, self.public_origin = service, auth, validated_origin(origin)
+        self.active_requests = threading.BoundedSemaphore(24)
         self.assets = {}
         for route, file, mime in (("/", "index.html", "text/html; charset=utf-8"),
                                   ("/ui.css", "ui.css", "text/css; charset=utf-8"),
@@ -191,6 +218,22 @@ class Server(ThreadingHTTPServer):
         connection, address = super().get_request()
         connection.settimeout(8)
         return connection, address
+
+    def process_request(self, request, address):
+        if not self.active_requests.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self.active_requests.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.active_requests.release()
 
 
 class Handler(BaseHTTPRequestHandler):
