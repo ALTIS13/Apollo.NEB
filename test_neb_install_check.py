@@ -12,6 +12,9 @@ SOURCE = Path(__file__).resolve().parent
 
 class InstallerPathTests(unittest.TestCase):
     def setUp(self):
+        if os.name == 'posix':
+            previous = os.umask(0o077)
+            self.addCleanup(os.umask, previous)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.home = Path(temp.name).resolve()
@@ -100,12 +103,12 @@ class InstallerPathTests(unittest.TestCase):
         self.base.chmod(0o750)
         self.launcher.parent.mkdir()
         self.launcher.write_bytes(b'unrelated program\n')
-        env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / '.config'),
-                   XDG_STATE_HOME=str(self.home / '.state'))
-        command = ['/bin/sh', str(SOURCE / 'install.sh'), '--', '--password-stdin']
+        command = ['/bin/sh', str(SOURCE / 'install.sh'), '--prefix', str(self.prefix),
+                   '--config-dir', str(self.home / '.config'), '--state-dir', str(self.home / '.state'),
+                   '--', '--password-stdin']
 
         def install():
-            return subprocess.run(command, env=env, input='fixture-only installer password\n',
+            return subprocess.run(command, input='fixture-only installer password\n',
                                   capture_output=True, text=True, encoding='utf-8', timeout=15)
 
         self.assert_refusal(install(), 'launcher')
