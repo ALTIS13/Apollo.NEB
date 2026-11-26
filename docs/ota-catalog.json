@@ -1,5 +1,50 @@
 [
   {
+    "tag_name": "v0.9.2",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-11-26T20:06:29Z",
+    "html_url": "https://github.com/ALTIS13/Apollo.NEB/releases/tag/v0.9.2",
+    "body": "# Apollo.NEB 0.9.2\n\nОбщая панель для GPU-фермы и самостоятельных установок NEB Mainnet.\n\n- **Обзор** сводит хешрейт, питание и состояние нод. История показывает\n  температурные пороги и события, а GPU сгруппированы по нодам.\n- Гостю доступны текущие метрики. Пароль и 2FA открывают управление.\n  Резервные коды 2FA можно скачать в Markdown.\n- В **Нодах** можно привязать воркер по ключу или установить агент на\n  подготовленный Linux-хост по SSH. Для обновления доступны совместимая\n  версия, её изменения и статус установки. При сбое запуска возвращается\n  предыдущая сборка.\n- **Apollo.NEB Desktop** для Windows x64 показывает датчики NVIDIA и\n  позволяет выбрать предел мощности карты. Профиль «За ПК» подбирает\n  доступный пониженный лимит. Для применения нужны права администратора.\n  Привяжите ПК по ключу и разрешите управление в Desktop, чтобы менять\n  этот предел из своей HTTPS-панели.\n\nДля Linux доступны обычный архив, пакеты x64 для ядер 6.6 и 6.12\nи образы x64 UEFI. Для Windows x64 выберите Desktop или контроллер Linux-нод.\nСверьте SHA-256 выбранного файла перед установкой.\n\n**DevFee составляет 1,1% активного времени добычи.** Состояние видно в панели.\n\n[Как установить, обновить и откатить](https://github.com/ALTIS13/Apollo.NEB/blob/v0.9.2/docs/onboarding-and-distribution.md)\n",
+    "assets": [
+      {
+        "name": "apollo-neb-0.9.2-linux-x64-kernel-6.12.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.2/apollo-neb-0.9.2-linux-x64-kernel-6.12.tar.gz",
+        "digest": "sha256:81acf18e46c723a25f1be4a88db46454a8934d3084f4186a4ffd2202028cc8a1",
+        "size": 154143,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-0.9.2-linux-x64-kernel-6.6.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.2/apollo-neb-0.9.2-linux-x64-kernel-6.6.tar.gz",
+        "digest": "sha256:77d1c7bd236e3ee4b3babb14812b3e4471c65e9770f92fd69d1687838ccefa59",
+        "size": 154134,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-0.9.2-linux.tar.gz",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.2/apollo-neb-0.9.2-linux.tar.gz",
+        "digest": "sha256:06430c70c6d35220b2171c53d8d6adea7b492d8a067a5b2d33758ba84bacff34",
+        "size": 154060,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-0.9.2-windows-x64.zip",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.2/apollo-neb-0.9.2-windows-x64.zip",
+        "digest": "sha256:a98594b27b5898bec3c8cf6cc44b6c28bce59c39b81280736b74b307188642b5",
+        "size": 160134,
+        "state": "uploaded"
+      },
+      {
+        "name": "apollo-neb-desktop-0.9.2-windows-x64.zip",
+        "browser_download_url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v0.9.2/apollo-neb-desktop-0.9.2-windows-x64.zip",
+        "digest": "sha256:b3d9168309382c2263bc364631a4f8d16303e4302b20ce00fb2d21310ae4014e",
+        "size": 92064327,
+        "state": "uploaded"
+      }
+    ]
+  },
+  {
     "tag_name": "v0.9.0",
     "draft": false,
     "prerelease": false,
