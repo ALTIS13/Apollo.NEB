@@ -2,7 +2,7 @@
 
 Панель добычи NEB Mainnet для Linux-нод и приложение мониторинга для Windows.
 
-[Скачать выпуск](https://github.com/ALTIS13/Apollo.NEB/releases) · [Настройка и обновление](docs/onboarding-and-distribution.md) · [Что нового](docs/releases/0.9.2-rc.7.md)
+[Скачать выпуск](https://github.com/ALTIS13/Apollo.NEB/releases) · [Настройка и обновление](docs/onboarding-and-distribution.md) · [Что нового](docs/releases/0.9.2.md)
 
 | Система | Что скачать |
 | --- | --- |

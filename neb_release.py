@@ -22,7 +22,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from neb_core import read, store
 from neb_setup import Asset, download, file_digest
 
-VERSION = "0.9.2-rc.7"
+VERSION = "0.9.2"
 MINIMUM_RELEASE = "0.7.1-rc.1"
 REPO = "ALTIS13/Apollo.NEB"
 RELEASES = f"https://github.com/{REPO}/releases"
