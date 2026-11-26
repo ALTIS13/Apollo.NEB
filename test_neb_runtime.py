@@ -186,6 +186,42 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"worker did not reach condition: {row}")
 
+    def test_managed_restart_replaces_only_a_running_worker_process(self):
+        import neb_app
+        import neb_core as core
+        from test_neb_core import OWNER
+
+        observed = self.root / "launches"
+        manager = self.manager(
+            "import os, time\n"
+            f"with open({str(observed)!r}, 'a', encoding='ascii') as f: f.write(str(os.getpid()) + '\\n')\n"
+            "while True: time.sleep(0.02)"
+        )
+        config = self.root / "config"
+        core.store(config / "profile.json", {"wallet": OWNER, "worker": "test", "pool": "suprnova-eu"})
+        service = neb_app.Service(config, self.root, manager, core.DEFAULT_POOLS, None)
+        service.poll()
+        self.assertFalse(service.group("restart", ["test"])["results"][0]["ok"])
+        self.assertFalse(observed.exists())
+        self.assertTrue(service.group("start", ["test"])["results"][0]["ok"])
+
+        def launches(expected):
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                rows = observed.read_text().splitlines() if observed.exists() else []
+                if len(rows) == expected:
+                    return list(map(int, rows))
+                time.sleep(.04)
+            self.fail("Expected the synthetic worker to record its launch")
+
+        original, = launches(1)
+        self.assertTrue(service.group("restart", ["test"])["results"][0]["ok"])
+        before, after = launches(2)
+        self.assertEqual(before, original)
+        self.assertNotEqual(before, after)
+        self.assertTrue(service.group("stop", ["test"])["results"][0]["ok"])
+        self.assertEqual(launches(2), [before, after])
+
     def test_argv_is_literal_and_only_numeric_metrics_escape(self):
         observed = self.root / "argv.json"
         manager = self.manager(

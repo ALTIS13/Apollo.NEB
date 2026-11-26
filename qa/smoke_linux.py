@@ -82,6 +82,8 @@ def test(directory):
     policy = directory / "fixture-policy"
     policy.write_text("enabled", encoding="utf-8")
     installed_code = prefix / "lib" / "apollo-neb" / "current"
+    probe = "import sys; sys.path.insert(0, sys.argv[1]); import neb_update_apply"
+    subprocess.run(["python3", "-I", "-c", probe, str(installed_code)], check=True, timeout=5)
 
     def serve(window=300):
         boot = (
@@ -111,7 +113,8 @@ def test(directory):
             code, data, _ = request(port, "GET", "/api/status", cookie=cookie)
             assert code == 200
             status = json.loads(data)
-            assert status["profile"]["wallet"] == SYNTHETIC_NEVER_PAID
+            assert status["profile"]["wallet_configured"] is True
+            assert SYNTHETIC_NEVER_PAID.encode() not in data
             assert status["support"]["enabled"] is True and status["support"]["basis_points"] == 110
             assert "wallet" not in status["support"]
             return status

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import neb_release as releases
 
-VARIANTS = (("linux", None), ("linux", "6.6"), ("linux", "6.12"), ("windows", None))
+VARIANTS = (("linux", None), ("linux", "6.6"), ("linux", "6.12"), ("windows", None), ("windows-desktop", None))
 
 
 def catalog(items):

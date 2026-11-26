@@ -44,6 +44,22 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(history["count"], 2)
         self.assertEqual(history["series"][0]["t"], first)
 
+    def test_farm_history_records_all_source_samples_and_leaves_outage_gap(self):
+        archive = Archive(self.path)
+        metrics = {"nodes": {"total": 2, "online": 2}, "hashrate_hs": 4000000, "watts": 80,
+                   "temperatures": {"edge": 65, "hot": None, "hbm": None}, "workers": {"running": 1}}
+        self.assertFalse(archive.has_samples())
+        archive.farm_sample(1800, metrics)
+        archive.farm_sample(1815, {**metrics, "nodes": {"total": 2, "online": 1}})
+        archive.farm_sample(1830, {**metrics, "hashrate_hs": 0})
+        history = archive.history("30m", now=1830)
+        self.assertTrue(archive.has_samples())
+        self.assertEqual(history["count"], 2)
+        self.assertEqual([(row["t"], row["rate"]) for row in history["series"]], [(1800, 4), (1830, 0)])
+        self.assertEqual(history["series"][0]["efficiency"], .05)
+        self.assertEqual(history["markers"], [])
+        self.assertEqual(history["thresholds"], [])
+
     def test_threshold_changes_survive_aggregation_and_clear_hbm_limit(self):
         archive = Archive(self.path)
         initial = {"edge_limit": 80, "hot_limit": 100, "hbm_limit": None}

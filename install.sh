@@ -7,20 +7,32 @@ neb_cfg=
 neb_state=
 service=0
 run_now=0
+join_origin=
+join_stdin=0
+share_diagnostics=0
+allow_upgrades=0
 fee_notice='DevFee: 1.1% of active mining time. You can see its status in the dashboard.'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help)
       printf '%s\n' 'Apollo.NEB Linux (Python 3.10+, working pidfd, no sudo)' \
-        './install.sh [--run | --service] [--prefix PATH] [--config-dir PATH] [--state-dir PATH] -- [configure options]' \
+        './install.sh [--run | --service] [--join HTTPS_ORIGIN] [--share-diagnostics] [--allow-upgrades] -- [configure options]' \
         '--run: open the local dashboard now; configure wallets and GPUs in the browser.' \
         '--service: install and start the user service; workers do not start automatically.' \
+        '--join: pair with a management panel using an enrollment key before starting the service.' \
+        '--share-diagnostics: allow the paired panel to read system and worker events and request a worker restart.' \
+        '--allow-upgrades: allow updates from the central panel with --service and --join.' \
+        'To override installation paths use --prefix, --config-dir or --state-dir.' \
         "$fee_notice" \
         'Examples: ./install.sh; ./install.sh --service -- --wallet YOUR_NEB_MAINNET_ADDRESS --totp' \
         'Run ./install.sh -- --help for configuration options.'
       exit 0 ;;
     --service) service=1; shift ;;
     --run) run_now=1; shift ;;
+    --join) join_origin="${2:?Missing dashboard HTTPS origin}"; shift 2 ;;
+    --join-stdin) join_stdin=1; shift ;;
+    --share-diagnostics) share_diagnostics=1; shift ;;
+    --allow-upgrades) allow_upgrades=1; shift ;;
     --prefix) neb_prefix="${2:?Missing prefix}"; shift 2 ;;
     --) shift; break ;;
     --config-dir|--state-dir)
@@ -37,6 +49,22 @@ if [ "${1:-}" = "--help" ]; then
 fi
 test "$(id -u)" -ne 0 || { printf '%s\n' 'Run as a dedicated regular Linux user, without sudo.' >&2; exit 1; }
 test "$((service+run_now))" -le 1 || { printf '%s\n' 'Choose either --run or --service.' >&2; exit 2; }
+if [ "$allow_upgrades" -eq 1 ] && { [ "$service" -ne 1 ] || [ -z "$join_origin" ]; }; then
+  printf '%s\n' '--allow-upgrades requires --service and --join.' >&2
+  exit 2
+fi
+test "$share_diagnostics" -eq 0 || test -n "$join_origin" || {
+  printf '%s\n' '--share-diagnostics requires --join.' >&2; exit 2;
+}
+case "${join_origin:-https://}" in https://*) ;; *) printf '%s\n' '--join requires HTTPS.' >&2; exit 2;; esac
+if [ "$join_stdin" -eq 1 ]; then
+  if [ "$service" -ne 1 ] || [ -z "$join_origin" ] ||
+      ! IFS= read -r setup_password || ! IFS= read -r enrollment_key ||
+      [ -z "$setup_password" ] || [ -z "$enrollment_key" ]; then
+    printf '%s\n' '--join-stdin requires --service, --join and two input lines (password and enrollment key).' >&2
+    exit 2
+  fi
+fi
 printf '\n%s\n' 'APOLLO.NEB  /  LOCAL MINING' '01 / Checking Linux and installation paths'
 printf '%s\n' "$fee_notice" 'Mining only begins when you start a worker.'
 case "$neb_prefix" in /*) ;; *) printf 'Prefix must be absolute.\n' >&2; exit 2;; esac
@@ -69,12 +97,19 @@ base="$neb_prefix/lib/apollo-neb"
 mkdir -p -- "$base" "$neb_prefix/bin"
 release=$(mktemp -d "$base/release.XXXXXXXX")
 install -d -m0700 "$release/web"
-modules='neb.py neb_core.py neb_app.py neb_history.py neb_runtime.py neb_setup.py neb_wallet.py neb_release.py neb_fleet.py neb_devfee.py neb_network.py developer-support.json'
-assets='index.html ui.js ui.css brand.svg qr.js view.html view.js live-metrics.js recovery-codes.js history-chart.js select-menu.js'
+modules='neb.py neb_core.py neb_app.py neb_history.py neb_runtime.py neb_setup.py neb_release.py neb_fleet.py neb_devfee.py neb_network.py neb_overview.py neb_platform.py neb_node_update.py neb_update_apply.py neb_install_check.py neb_remote_install.py neb_remote_bootstrap.py neb_atlas.py developer-support.json'
+assets='index.html ui.js ui.css brand.svg qr.js view.js live-metrics.js recovery-codes.js history-chart.js select-menu.js'
 for f in $modules; do install -m0600 "$src/$f" "$release/$f"; done
 for f in $assets; do install -m0600 "$src/web/$f" "$release/web/$f"; done
 printf '%s\n' '02 / Preparing the administrator account'
-if ! python3 -I "$release/neb.py" "$@" --publish-current "$neb_prefix"; then
+configure_release() {
+  if [ "$join_stdin" -eq 1 ]; then
+    printf '%s\n' "$setup_password" | python3 -I "$release/neb.py" "$@" --publish-current "$neb_prefix" --password-stdin
+  else
+    python3 -I "$release/neb.py" "$@" --publish-current "$neb_prefix"
+  fi
+}
+if ! configure_release "$@"; then
   for f in $modules; do rm -- "$release/$f"; done
   for f in $assets; do rm -- "$release/web/$f"; done
   rmdir -- "$release/web"
@@ -86,8 +121,22 @@ if ! python3 -I "$release/neb.py" "$@" --publish-current "$neb_prefix"; then
   rmdir -- "$release"
   exit 1
 fi
+unset setup_password
 if [ ! -e "$neb_prefix/bin/apollo-neb" ]; then
   install -m0700 "$src/apollo-neb" "$neb_prefix/bin/apollo-neb"
+fi
+if [ -n "$join_origin" ]; then
+  set -- node-pair --origin "$join_origin"
+  if [ "$share_diagnostics" -eq 1 ]; then set -- "$@" --share-diagnostics; fi
+  if [ "$allow_upgrades" -eq 1 ]; then set -- "$@" --allow-upgrades; fi
+  if [ -n "${neb_state:-}" ]; then set -- --state-dir "$neb_state" "$@"; fi
+  if [ -n "${neb_cfg:-}" ]; then set -- --config-dir "$neb_cfg" "$@"; fi
+  if [ "$join_stdin" -eq 1 ]; then
+    printf '%s\n' "$enrollment_key" | "$neb_prefix/bin/apollo-neb" "$@" --key-stdin
+    unset enrollment_key
+  else
+    "$neb_prefix/bin/apollo-neb" "$@"
+  fi
 fi
 printf '%s\n' '03 / Installing the dashboard'
 if [ "$service" -eq 1 ]; then

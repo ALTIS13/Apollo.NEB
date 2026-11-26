@@ -54,12 +54,10 @@ const PAGES = {overview: "Обзор фермы", workers: "Воркеры", nod
 const isRunning = worker => worker.state === "running" || worker.state === "mining";
 const rate = value => !Number.isFinite(value) ? "—" : value >= 1e6
   ? fmt(value / 1e6, "МХ/с", 3) : value >= 1e3 ? fmt(value / 1e3, "кХ/с", 2) : fmt(value, "Х/с", 1);
-const sum = (rows, field) => rows.length && rows.every(row => Number.isFinite(row[field]))
-  ? rows.reduce((total, row) => total + row[field], 0) : null;
 const safeLine = value => typeof value === "string" ? value.slice(0, 350) : "";
 
 const state = {
-  mode: "boot", view: "overview", status: null, generation: 0,
+  mode: "boot", view: "overview", status: null, generation: 0, historySource: "local", atlasKey: "",
   history: null, historyError: "", events: null, eventsError: "",
   eventsKey: "", chartKey: "", incidentsKey: "", poll: null, pollAgain: false,
   eventsKind: null, focusEvent: null,
@@ -67,17 +65,21 @@ const state = {
   authTotp: null, authInfoSeq: 0, authMutation: false, authEpoch: 0,
   selected: new Set(), groupBusy: false,
 };
+const setPublicOverview = setupPublicOverview();
 const cards = new Map();
-const vault = {seq: 0, busy: false, data: null, exportId: null};
 const setup = {seq: 0, busy: false, data: null, selected: new Set()};
 const totp = {seq: 0, busy: false, timer: null, expiresAt: 0};
-const fleet = {generation: 0, loading: false, busy: false, fresh: false, nodes: null, key: "", selected: new Map(), revokeId: null, inviteTimer: null};
+const fleet = {generation: 0, loading: false, busy: false, fresh: false, nodes: null, key: "", installTargets: [], installKey: "",
+  selected: new Map(), revokeId: null, inviteTimer: null};
+const gpuPower = {target: null, request: null};
 const workerLog = {id: null, request: null, key: ""};
 const network = {data: null, request: null, error: ""};
-const releases = {seq: 0, verifySeq: 0, pending: "", info: null, candidate: null, message: "", tone: "neutral"};
+const releases = {seq: 0, verifySeq: 0, pending: "", target: null, info: null, versions: [], candidate: null,
+  message: "", tone: "neutral", confirming: false, queued: false};
 const RELEASE_HOME = "https://github.com/ALTIS13/Apollo.NEB/releases";
 const RELEASE_CHANNELS = new Map([["stable", "Основной"], ["testing", "Тестовый"]]);
-const RELEASE_PLATFORMS = new Map([["linux", "Linux"], ["windows", "Windows x64"], ["unsupported", "Не поддерживается"]]);
+const RELEASE_PLATFORMS = new Map([["linux", "Linux"], ["windows", "Windows x64"],
+  ["windows-desktop", "Apollo.NEB Desktop · Windows x64"], ["unsupported", "Не поддерживается"]]);
 
 class ApiError extends Error {
   constructor(status, detail) {
@@ -128,6 +130,9 @@ function showLogin(expired = false) {
   state.mode = "login";
   state.view = "overview";
   state.status = state.history = state.events = null;
+  text($("atlas-event-details"), "");
+  $("history-source").value = "local";
+  applyHistorySource();
   state.eventsKind = state.focusEvent = null;
   Object.assign(workerLog, {id: null, request: null, key: ""});
   $("worker-log-entries").replaceChildren();
@@ -146,18 +151,17 @@ function showLogin(expired = false) {
   for (const id of ["profile-form", "limits-form", "login-form"]) $(id).reset();
   for (const dialog of all("dialog[open]")) dialog.close();
   $("boot").hidden = $("app").hidden = $("logout").hidden = $("devfee").hidden = true;
-  $("login").hidden = false;
+  $("public-overview").hidden = false;
   text($("login-message"), expired ? "Сеанс завершён. Войдите снова." : "");
-  connection("Вход в панель", "neutral");
+  connection("Режим просмотра", "neutral");
   notice("");
-  refreshAuthInfo();
-  $("password").focus();
+  setPublicOverview(true);
 }
 
 function canStart(worker) {
   return state.online && !state.actions.has(worker.id)
     && !["running", "mining", "starting", "stopping", "unavailable"].includes(worker.state)
-    && Boolean(state.status?.profile?.wallet);
+    && Boolean(state.status?.profile?.wallet_configured);
 }
 
 function workerCards(workers) {
@@ -210,7 +214,7 @@ function workerCards(workers) {
     fields.message.hidden = !details || !["protection", "failed", "blocked", "unavailable"].includes(worker.state);
     text(fields.message, details);
     start.disabled = !canStart(worker);
-    start.title = state.status?.profile?.wallet ? "" : "Сначала задайте профиль пула";
+    start.title = state.status?.profile?.wallet_configured ? "" : "Сначала задайте профиль пула";
     stop.disabled = !state.online || state.actions.has(worker.id) || !isRunning(worker);
   });
 }
@@ -225,30 +229,31 @@ function hasCapability(key) {
 }
 
 function renderStatus() {
-  const {workers: rawWorkers, profile, limits, support} = state.status || {};
+  const {workers: rawWorkers, profile, limits, support, overview, atlas} = state.status || {};
   const localWorkers = hasCapability("local_workers");
   const workers = localWorkers ? inList(rawWorkers) : [];
   $("controller-note").hidden = localWorkers;
   for (const control of all("[data-discovery], [data-limits], [data-profile], #profile-open, [data-view='workers']")) {
     control.hidden = !localWorkers;
   }
-  for (const control of all("[data-wallets]")) control.hidden = !hasCapability("wallet_tools");
   if (!localWorkers && state.view === "workers") setView("nodes");
   const active = workers.filter(isRunning);
   const devices = workers.filter(worker => worker.device);
-  text($("live-workers"), localWorkers ? `${active.length} / ${workers.length}` : "—");
-  const liveRate = !active.length && workers.length
-    && workers.every(worker => !["starting", "stopping", "unavailable"].includes(worker.state)) ? 0 : sum(active, "rate_hs");
-  const livePower = sum(devices, "watts");
-  showLiveReading($("live-rate"), rate(liveRate), liveRate);
-  showLiveReading($("live-watts"), fmt(livePower, "Вт"), livePower);
-  text($("live-shares"), `${n(sum(active, "accepted"), 0)} / ${n(sum(active, "rejected"), 0)}`);
-  $("first-run").hidden = !localWorkers || Boolean(workers.length && profile?.wallet);
-  text($("step-profile-title"), profile?.wallet ? "Профиль пула сохранён" : "Задайте профиль пула");
-  text($("step-profile-action"), profile?.wallet ? "Изменить профиль" : "Настроить профиль");
+  const coverage = overview?.nodes;
+  $("overview-coverage").hidden = !coverage?.total;
+  const atlasCount = overview?.atlas_gpus;
+  const atlasCoverage = atlasCount ? ` · Atlas ${n(atlasCount.active, 0)} / ${n(atlasCount.total, 0)} GPU` : "";
+  text($("overview-coverage"), coverage?.total ? `Ноды на связи · ${n(coverage.online, 0)} из ${n(coverage.total, 0)}${atlasCoverage}` : "");
+  text($("live-workers"), overview?.workers ? `${n(overview.workers.running, 0)} / ${n(overview.workers.total, 0)}` : "—");
+  showLiveReading($("live-rate"), rate(overview?.hashrate_hs), overview?.hashrate_hs);
+  showLiveReading($("live-watts"), fmt(overview?.watts, "Вт"), overview?.watts);
+  text($("live-shares"), `${n(overview?.shares?.accepted, 0)} / ${n(overview?.shares?.rejected, 0)}`);
+  $("first-run").hidden = !localWorkers || Boolean(workers.length && profile?.wallet_configured);
+  text($("step-profile-title"), profile?.wallet_configured ? "Профиль пула сохранён" : "Задайте профиль пула");
+  text($("step-profile-action"), profile?.wallet_configured ? "Изменить профиль" : "Настроить профиль");
   text($("step-workers-title"), workers.length ? "Воркеры добавлены" : "Добавьте воркеры");
-  all("[data-profile]").forEach(button => button.classList.toggle("primary", !profile?.wallet));
-  $("first-run").querySelector("[data-discovery]").classList.toggle("primary", Boolean(profile?.wallet && !workers.length));
+  all("[data-profile]").forEach(button => button.classList.toggle("primary", !profile?.wallet_configured));
+  $("first-run").querySelector("[data-discovery]").classList.toggle("primary", Boolean(profile?.wallet_configured && !workers.length));
   const supportPercent = fmt(support?.basis_points / 100, "%", 2);
   const [feeState, feeTone, feeDetails] = !state.online ? DEVFEE.offline : DEVFEE[support?.state] || DEVFEE.unavailable;
   const feeLabel = `DevFee · ${feeState.toLocaleLowerCase("ru")}`;
@@ -276,16 +281,18 @@ function renderStatus() {
     const {worker, key, tone} = nearby.find(entry => entry.tone === "bad") || nearby[0];
     text($("attention-detail"), `${worker.label || worker.id}: ${METRICS[key][0]} ${temperature(worker[key])} · ${tone === "bad" ? "достигнут предел" : "приближение к пределу"}`);
   }
-  renderThermalSensors(devices, limits);
+  renderThermalSensors(devices, limits, overview?.temperatures);
+  applyHistorySource();
+  renderAtlasNode(atlas);
   text($("worker-summary"), workers.length ? `В работе: ${active.length} из ${workers.length}` : "Нет настроенных воркеров.");
   $("workers-empty").hidden = !localWorkers || Boolean(workers.length);
   workerCards(workers);
   renderGroup(workers);
   $("profile-open").disabled = !state.online;
-  for (const button of all("[data-limits], [data-profile], [data-wallets], [data-discovery], [data-totp]")) button.disabled = !state.online;
+  for (const button of all("[data-limits], [data-profile], [data-discovery], [data-totp]")) button.disabled = !state.online;
 }
 
-function renderThermalSensors(devices, limits) {
+function renderThermalSensors(devices, limits, farm) {
   const sensors = $("live-thermal");
   if (!sensors.childElementCount) {
     for (const key of TEMPERATURES) {
@@ -297,13 +304,14 @@ function renderThermalSensors(devices, limits) {
   for (const [index, key] of TEMPERATURES.entries()) {
     const row = sensors.children[index];
     const values = devices.map(device => device[key]).filter(Number.isFinite);
-    const reading = values.length ? Math.max(...values) : null;
+    const local = values.length ? Math.max(...values) : null;
+    const reading = farm ? farm[key] : local;
     const limit = limits?.[`${key}_limit`];
     const metric = row.querySelector("dd");
     showTemperature(metric, reading);
-    metric.dataset.tone = thermalTone(reading, limit);
+    metric.dataset.tone = thermalTone(local, limit);
     text(row.querySelector("small"),
-      `Датчики: ${values.length} / ${devices.length} · предел ${Number.isFinite(limit) ? temperature(limit) : "не задан"}`);
+      devices.length ? `На этой ноде: ${values.length} / ${devices.length} датчиков · предел ${Number.isFinite(limit) ? temperature(limit) : "не задан"}` : "");
   }
 }
 
@@ -425,8 +433,8 @@ function renderNetwork() {
   else if (snapshot?.state === "loading") detail = "Обновляем данные сети…";
   else if (snapshot?.state === "stale") detail = "Данные сети устарели.";
   else if (snapshot?.state === "fresh") detail = Number.isFinite(estimate)
-    ? `Валовая оценка до комиссий при среднем хешрейте ${rate(snapshot.local_rate_hs)} за последние 30 минут.`
-    : "Для оценки нужно больше свежих замеров локального хешрейта за последние 30 минут.";
+    ? `Оценка до комиссий по свежему хешрейту фермы ${rate(snapshot.farm_rate_hs)}.`
+    : "Для оценки нужны свежие значения хешрейта воркеров.";
   text($("network-message"), [last, detail].filter(Boolean).join(" "));
   $("network-check").disabled = Boolean(network.request) || snapshot?.state === "loading";
 }
@@ -463,6 +471,33 @@ function svg(tag, attrs, content) {
   return el;
 }
 
+function applyHistorySource() {
+  const selector = $("history-source");
+  const farmAvailable = state.status?.capabilities?.farm_history === true;
+  const atlasAvailable = Boolean(state.status?.atlas);
+  $("history-source-row").hidden = !farmAvailable && !atlasAvailable;
+  for (const [id, available] of [["history-farm-option", farmAvailable], ["history-atlas-option", atlasAvailable]]) {
+    const option = $(id);
+    if (option.hidden === available) option.hidden = !available;
+  }
+  if (selector.selectedOptions[0]?.hidden) selector.value = "local";
+  const source = selector.value;
+  if (state.historySource === source) return;
+  state.historySource = source;
+  state.history = null;
+  state.historyError = "";
+  const atlas = source === "atlas";
+  const farm = source === "farm";
+  const longest = $("history-max-period");
+  longest.value = atlas ? "30d" : "31d";
+  text(longest, atlas ? "30 дней" : "31 день");
+  text($("history-active-metric"), atlas ? "Активные GPU" : "Активные воркеры");
+  text($("history-edge-metric"), farm ? "Ядро · по ферме" : "Ядро · средняя");
+  text($("history-memory-metric"), farm ? "Память · по ферме" : "Память · средняя");
+  text($("history-title"), atlas ? "История Atlas" : farm ? "История фермы" : "Локальная история");
+  for (const id of ["history-source", "metric", "period"]) syncStyledSelect($(id));
+}
+
 function drawHistory() {
   if (state.view !== "overview") return;
   const width = $("chart-wrap").clientWidth;
@@ -470,9 +505,10 @@ function drawHistory() {
   const period = $("period").value;
   const data = state.history?.range === period ? state.history : null;
   const metric = $("metric").value;
-  const [label, unit] = METRICS[metric];
+  const [, unit] = METRICS[metric];
+  const label = $("metric").selectedOptions[0].textContent;
   const status = state.historyError || (data ? "" : "Загружаем историю…");
-  const key = JSON.stringify([width, metric, data, status]);
+  const key = JSON.stringify([width, metric, state.historySource, data, status]);
   if (state.chartKey === key) return;
   state.chartKey = key;
 
@@ -480,7 +516,8 @@ function drawHistory() {
   chart.setAttribute("aria-label", label + " · " + $("period").selectedOptions[0].textContent);
   text($("history-count"), Number.isFinite(data?.count) ? `Замеров: ${n(data.count, 0)}` : "");
   const help = status && data ? `${status} Показаны последние полученные данные.`
-    : "Разрывы линии показывают пропуски измерений. Стрелки на клавиатуре перемещают указатель.";
+    : state.historySource === "farm" ? "Замер добавляется, когда все ноды на связи. Стрелки перемещают указатель."
+      : "Разрывы линии показывают пропуски измерений. Стрелки на клавиатуре перемещают указатель.";
   text($("chart-caption"), help);
   $("chart-empty").hidden = false;
   text($("chart-empty"), status || "Нет значений за этот период.");
@@ -512,7 +549,8 @@ function drawHistory() {
 
 function renderChartEvents(markers) {
   const latest = markers.slice(-4).reverse();
-  const key = JSON.stringify([latest, markers.length > 4]);
+  const more = state.historySource === "local" && markers.length > 4;
+  const key = JSON.stringify([latest, more]);
   if (state.incidentsKey === key) return;
   state.incidentsKey = key;
   $("chart-incidents").hidden = !latest.length;
@@ -525,7 +563,7 @@ function renderChartEvents(markers) {
     button.addEventListener("click", () => openChartEvent(event));
     return button;
   });
-  if (markers.length > 4) {
+  if (more) {
     const button = create("button", "Журнал событий", "incident-link");
     button.type = "button";
     button.addEventListener("click", () => openChartEvent());
@@ -535,6 +573,11 @@ function renderChartEvents(markers) {
 }
 
 function openChartEvent(event = null) {
+  if (state.historySource === "atlas" && event) {
+    text($("atlas-event-details"), [eventTime(event.time), safeLine(event.worker), safeLine(event.detail)].filter(Boolean).join(" · "));
+    $("atlas-event-dialog").showModal();
+    return;
+  }
   $("event-filter").value = event?.type || "";
   syncStyledSelect($("event-filter"));
   state.focusEvent = event?.id ?? null;
@@ -549,13 +592,15 @@ async function refreshTimeline() {
   const authEpoch = state.authEpoch;
   const view = state.view;
   const period = $("period").value;
+  const source = state.historySource;
   const kind = $("event-filter").value;
   const current = () => generation === state.generation && authEpoch === state.authEpoch && state.mode === "app" && seq === state.timelineSeq
-    && view === state.view && (view === "overview" ? period === $("period").value : kind === $("event-filter").value);
+    && view === state.view && (view === "overview" ? period === $("period").value && source === state.historySource
+      : kind === $("event-filter").value);
   try {
     if (view === "overview") {
       loadNetwork();
-      const data = await api(`history?range=${encodeURIComponent(period)}`);
+      const data = await api("history?" + new URLSearchParams({range: period, source}));
       if (!current()) return;
       state.history = data;
       state.historyError = "";
@@ -618,7 +663,8 @@ async function refreshStatus({fresh = false} = {}) {
       const initial = state.mode !== "app";
       state.mode = "app";
       $("app").hidden = $("logout").hidden = false;
-      $("boot").hidden = $("login").hidden = true;
+      $("boot").hidden = $("public-overview").hidden = true;
+      setPublicOverview(false);
       renderStatus();
       if (initial) setView("overview");
       else if (state.view === "overview") drawHistory();
@@ -952,29 +998,16 @@ async function disableTotp(event) {
 
 function resetAuxiliary() {
   clearTotp();
-  resetWalletForms();
-  vault.seq++;
-  vault.busy = false;
-  vault.data = null;
   setup.seq++;
   setup.busy = false;
   setup.data = null;
   setup.selected.clear();
-  for (const id of ["wallets-dialog", "discovery-dialog"]) setAuxBusy(id, false);
-  for (const id of ["wallets-list", "miner-list", "device-list", "group-results"]) $(id).replaceChildren();
-  for (const id of ["wallets-message", "wallets-status", "discovery-message", "discovery-status", "wallet-export-target", "group-message"]) text($(id), "");
+  setAuxBusy("discovery-dialog", false);
+  for (const id of ["miner-list", "device-list", "group-results"]) $(id).replaceChildren();
+  for (const id of ["discovery-message", "discovery-status", "group-message"]) text($(id), "");
   $("group-results").hidden = true;
   resetReleases();
   clearFleet();
-}
-
-function resetWalletForms() {
-  vault.exportId = null;
-  for (const id of ["wallet-create", "wallet-export"]) {
-    $(id).reset();
-    $(id).hidden = true;
-  }
-  text($("wallet-export-target"), "");
 }
 
 function actionButton(label, handler, css) {
@@ -982,110 +1015,6 @@ function actionButton(label, handler, css) {
   btn.type = "button";
   btn.addEventListener("click", handler);
   return btn;
-}
-
-function renderWallets() {
-  const data = vault.data;
-  const items = inList(data?.items);
-  $("wallets-install").hidden = !data || data.available !== false;
-  $("wallet-new").hidden = !data?.available;
-  text($("wallets-status"), safeLine(data?.message) || (data?.available ? items.length ? `Кошельков: ${items.length}` : "Кошельков пока нет."
-    : data ? "Для создания кошелька требуется установить проверенный модуль. Публичный адрес можно добавить без него."
-    : "Запрашиваем списки кошельков…"));
-  const list = items.slice(0, 100).map(item => {
-    const row = create("li");
-    const body = create("div");
-    const label = safeLine(item.label) || "Кошелёк NEB";
-    const address = safeLine(item.address);
-    body.append(create("h3", label), create("code", address));
-    const actions = create("div", undefined, "panel-actions");
-    if (/^neb1[023456789acdefghjklmnpqrstuvwxyz]{58}$/.test(address)) {
-      actions.append(actionButton("В профиль", () => {
-        $("wallets-dialog").close();
-        openProfile(address);
-      }));
-    }
-    if (data?.available && typeof item.id === "string") {
-      actions.append(actionButton("Скачать резервную копию", () => {
-        resetWalletForms();
-        vault.exportId = item.id;
-        text($("wallet-export-target"), label);
-        text($("wallets-message"), "");
-        $("wallet-export").hidden = false;
-        $("wallet-export-password").focus();
-      }));
-    }
-    row.append(body, actions);
-    return row;
-  });
-  $("wallets-list").replaceChildren(...list);
-}
-
-async function loadWallets() {
-  if (vault.busy || !$("wallets-dialog").open) return;
-  const seq = ++vault.seq;
-  vault.busy = true;
-  setAuxBusy("wallets-dialog", true);
-  if (!vault.data) text($("wallets-status"), "Запрашиваем список кошельков…");
-  try {
-    const data = await api("wallets");
-    if (seq !== vault.seq || !$("wallets-dialog").open) return;
-    vault.data = data;
-    renderWallets();
-  } catch (error) {
-    if (seq !== vault.seq) return;
-    if (error.status === 401) return showLogin(true);
-    vault.data = null;
-    renderWallets();
-    text($("wallets-status"), "Список кошельков недоступен.");
-  } finally {
-    if (seq === vault.seq) {
-      vault.busy = false;
-      setAuxBusy("wallets-dialog", false);
-    }
-  }
-}
-
-function openWallets() {
-  if (!state.online || !hasCapability("wallet_tools") || $("wallets-dialog").open) return;
-  $("wallets-dialog").showModal();
-  loadWallets();
-}
-
-function saveEncryptedBackup(data) {
-  if (typeof data.backup !== "string" || !data.backup || data.backup.length > 8192) throw new Error();
-  const blob = new Blob([Uint8Array.from(atob(data.backup), char => char.charCodeAt(0))], {type: "application/octet-stream"});
-  const link = create("a");
-  link.download = typeof data.filename === "string" && /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,100}\.neb$/.test(data.filename) ? data.filename : "wallet.neb";
-  const url = URL.createObjectURL(blob);
-  link.href = url;
-  document.body.append(link);
-  try { link.click(); }
-  finally {
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-  }
-}
-
-async function walletMutation(path, body, waitMessage, onSuccess) {
-  if (vault.busy || !$("wallets-dialog").open) return;
-  const seq = ++vault.seq;
-  vault.busy = true;
-  setAuxBusy("wallets-dialog", true);
-  text($("wallets-message"), waitMessage);
-  try {
-    const data = await api(path, body, path === "wallets/install" ? 180000 : 45000);
-    if (seq === vault.seq) await onSuccess(data);
-  } catch (error) {
-    if (seq !== vault.seq) return;
-    if (error.status === 401) return showLogin(true);
-    text($("wallets-message"), errorText(error, "Операция не подтверждена."));
-  } finally {
-    if (seq === vault.seq) {
-      vault.busy = false;
-      setAuxBusy("wallets-dialog", false);
-    }
-  }
 }
 
 function renderDiscovery() {
@@ -1196,13 +1125,16 @@ function releaseCandidate(data) {
   const tag = safeLine(data.latest);
   const version = /^v?(\d{1,4}\.\d{1,4}\.\d{1,4})(?:-rc\.\d{1,4})?$/.exec(tag);
   const asset = data.asset;
+  const desktop = data.platform === "windows-desktop";
+  const maximum = (desktop ? 160 : 20) * 1024 ** 2;
   if (data.state !== "available" || !version || !asset
       || asset.url !== `${RELEASE_HOME}/download/${tag}/${asset.name}` || !/^[a-f0-9]{64}$/.test(asset.sha256)
-      || !Number.isSafeInteger(asset.size) || asset.size <= 0 || asset.size > 20 * 1024 ** 2) return null;
+      || !Number.isSafeInteger(asset.size) || asset.size <= 0 || asset.size > maximum) return null;
   const prefix = `apollo-neb-${version[1].split(".").map(Number).join(".")}`;
   const supportedNames = data.platform === "linux"
     ? [`${prefix}-linux.tar.gz`, `${prefix}-linux-x64-kernel-6.6.tar.gz`, `${prefix}-linux-x64-kernel-6.12.tar.gz`]
-    : data.platform === "windows" ? [`${prefix}-windows-x64.zip`] : [];
+    : desktop ? [`apollo-neb-desktop-${tag.slice(1)}-windows-x64.zip`]
+      : data.platform === "windows" ? [`${prefix}-windows-x64.zip`] : [];
   if (!supportedNames.includes(asset.name)) return null;
   return {
     asset, tag, notes: typeof data.notes === "string" ? data.notes.slice(0, 6000) : "",
@@ -1217,29 +1149,51 @@ function releaseVerification(message = "", tone = "neutral") {
   text($("release-verify-message"), message);
 }
 
-function clearReleaseCandidate() {
-  releases.candidate = null;
+function setReleaseCandidate(candidate) {
+  releases.candidate = candidate;
+  releases.confirming = false;
   releases.verifySeq++;
   $("release-file").value = "";
   releaseVerification();
   for (const id of ["release-notes", "release-verify", "release-guide"]) $(id).open = false;
 }
 
+function setReleaseVersions(versions) {
+  releases.versions = versions;
+  const select = $("release-version");
+  select.replaceChildren(...versions.map(release => new Option(release.tag, release.tag)));
+  setReleaseCandidate(versions[0] || null);
+  syncStyledSelect(select);
+}
+
+function clearReleaseCandidate() {
+  setReleaseVersions([]);
+}
+
 function renderReleases() {
-  const {info, pending, candidate, tone, message} = releases;
+  const {info, pending, target, candidate, tone, message, confirming, queued} = releases;
+  const firstInstall = target?.kind === "install";
   const selection = RELEASE_CHANNELS.get(info?.channel);
   const label = selection === "Тестовый" ? "Тестовый канал" : "Основной канал";
-  text($("release-summary"), info ? `${info.current} · ${label}` : "Канал и версия панели");
+  if (!target) text($("release-summary"), info ? `${info.current} · ${label}` : "Канал и версия панели");
+  text($("release-current-label"), firstInstall ? "Подготовка" : "Установлена");
   text($("release-current"), info?.current || "—");
-  text($("release-latest"), candidate?.tag || "—");
-  text($("release-platform"), RELEASE_PLATFORMS.get(info?.platform) || "—");
+  text($("release-latest"), releases.versions[0]?.tag || "—");
+  const platform = RELEASE_PLATFORMS.get(info?.platform) || "—";
+  text($("release-platform"), info?.kernel ? `${platform} · ядро ${info.kernel}` : platform);
+  text($("release-title"), target ? `${firstInstall ? "Установка" : "Обновления"} · ${target.label}` : "Обновления");
+  text($("release-channel-help"), target ? "Выбор канала применяется к этому списку." : "Тестовый канал включает предварительные выпуски.");
   $("release-testing").checked = info?.channel === "testing";
   $("release-stable").checked = info?.channel === "stable";
   $("release-channels").disabled = !info || Boolean(pending);
   $("release-check").disabled = Boolean(pending);
-  text($("release-check"), info ? "Проверить обновления" : "Повторить загрузку");
+  $("release-check").classList.toggle("primary", !candidate || !target);
+  text($("release-check"), info ? (firstInstall ? "Найти выпуски" : "Проверить обновления") : "Повторить загрузку");
   $("release-status").dataset.tone = pending ? "neutral" : tone;
   text($("release-status"), pending || message);
+  $("release-version-row").hidden = !releases.versions.length || Boolean(pending);
+  $("release-version").disabled = Boolean(pending) || !releases.versions.length;
+  syncStyledSelect($("release-version"));
   $("release-candidate").hidden = !candidate || Boolean(pending);
   for (const [id, url] of [["release-download", candidate?.asset.url], ["release-link", candidate?.page]]) {
     const link = $(id);
@@ -1248,7 +1202,9 @@ function renderReleases() {
     else link.removeAttribute("href");
   }
   $("release-guide").hidden = !candidate?.command;
-  $("release-manual").hidden = !candidate || Boolean(candidate.command);
+  $("release-manual").hidden = !candidate || Boolean(candidate.command) || firstInstall;
+  $("release-rollback").hidden = firstInstall;
+  text($("release-manual"), target ? "Архив подобран для системы этой ноды." : "Сверьте контрольную сумму и следуйте инструкции на странице релиза.");
   $("release-notes").hidden = !candidate?.notes;
   text($("release-notes-text"), candidate?.notes || "");
   text($("release-filename"), candidate?.asset.name || "");
@@ -1260,13 +1216,21 @@ function renderReleases() {
   text($("release-digest"), candidate?.asset.sha256 || "");
   text($("release-command"), candidate?.command || "");
   $("release-file-row").hidden = !candidate || !window.crypto?.subtle;
+  const canQueue = Boolean(target && candidate && info?.canQueue && !queued && !pending);
+  $("release-apply").hidden = !canQueue || confirming;
+  $("release-confirm").hidden = !canQueue || !confirming;
+  text($("release-confirm-text"), canQueue && confirming
+    ? `Установить ${candidate.tag} на «${target.label}»? ${firstInstall
+      ? "После установки нода появится в списке. Майнинг запускается по вашей команде."
+      : "На время обновления панель этой ноды перезапустится."}` : "");
 }
 
 function resetReleases() {
   releases.seq++;
   clearReleaseCandidate();
   $("release-rollback").open = false;
-  Object.assign(releases, {info: null, pending: "", tone: "neutral", message: "Загружаем настройки обновлений…"});
+  Object.assign(releases, {target: null, info: null, pending: "", tone: "neutral", confirming: false, queued: false,
+    message: "Загружаем настройки обновлений…"});
   renderReleases();
 }
 
@@ -1275,43 +1239,57 @@ async function loadReleases({check = false, channel = null} = {}) {
   const seq = ++releases.seq;
   const focus = document.activeElement;
   const previous = releases.info;
+  const target = releases.target;
   if (check || channel) clearReleaseCandidate();
   releases.pending = channel ? "Сохраняем канал…" : check ? "Проверяем обновления…" : "Загружаем настройки…";
   renderReleases();
   try {
-    if (channel) {
+    if (channel && !target) {
       const saved = await api("releases/channel", {channel});
       if (seq !== releases.seq) return;
       if (saved.channel !== channel) throw new Error();
     }
-    const data = await api(check ? "releases" : "releases?check=0", undefined, 18000);
+    let route = check ? "releases" : "releases?check=0";
+    if (target) {
+      const install = target.kind === "install";
+      const params = new URLSearchParams({[install ? "target" : "node"]: target.id});
+      if (channel || previous?.channel) params.set("channel", channel || previous.channel);
+      if (!check) params.set("check", "0");
+      route = (install ? "fleet/install/releases?" : "fleet/releases?") + params;
+    }
+    const data = await api(route, undefined, 18000);
     if (seq !== releases.seq) return;
     if (!RELEASE_CHANNELS.has(data.channel) || !RELEASE_PLATFORMS.has(data.platform) || !safeLine(data.current)) {
       throw new Error();
     }
-    releases.info = {channel: data.channel, platform: data.platform, current: safeLine(data.current)};
+    releases.info = {channel: data.channel, platform: data.platform, current: safeLine(data.current),
+      kernel: ["6.6", "6.12"].includes(data.kernel) ? data.kernel : null, canQueue: data.can_queue === true};
     if (previous?.channel !== data.channel || previous?.current !== data.current || previous?.platform !== data.platform) {
       clearReleaseCandidate();
     }
     if (check) {
-      releases.candidate = releaseCandidate(data);
+      const choices = Array.isArray(data.versions) ? data.versions.map(entry => releaseCandidate({
+        ...data, ...entry, latest: entry?.tag,
+      })) : [releaseCandidate(data)];
+      setReleaseVersions(choices.filter(Boolean));
       releases.tone = "good";
-      if (releases.candidate) releases.message = "Доступно обновление.";
-      else if (data.state === "current") releases.message = "Для этого канала обновлений нет.";
+      if (releases.candidate) releases.message = target?.kind === "install" ? "Выберите выпуск для установки." : "Доступно обновление.";
+      else if (data.state === "current") releases.message = "В этом канале нет совместимого выпуска.";
       else {
         releases.tone = "warn";
         releases.message = safeLine(data.message) || "Не удалось подтвердить доступный архив.";
       }
     } else if (!releases.candidate) {
-      releases.message = "Нажмите «Проверить обновления».";
+      releases.message = target?.kind === "install" ? "Выберите канал или загрузите выпуски." : "Нажмите «Проверить обновления».";
       releases.tone = "neutral";
     }
   } catch (error) {
     if (seq !== releases.seq) return;
     if (error.status === 401) return showLogin(true);
     clearReleaseCandidate();
-    if (!check) releases.info = null;
-    releases.message = channel ? "Изменение канала не подтверждено. Загрузите настройки снова."
+    if (!check || target) releases.info = null;
+    releases.message = target && error.status === 409 ? errorText(error, "Нужен свежий отчёт ноды о версии и системе.")
+      : channel && !target ? "Изменение канала не подтверждено. Загрузите настройки снова."
       : check ? "Проверка обновлений недоступна." : "Не удалось загрузить настройки обновлений.";
     releases.tone = "warn";
   } finally {
@@ -1327,13 +1305,48 @@ async function loadReleases({check = false, channel = null} = {}) {
   }
 }
 
-function openReleases() {
+function openReleases(target = null) {
   if (state.mode !== "app") return;
   const dialog = $("release-dialog");
   if (dialog.open) return;
+  resetReleases();
+  releases.target = target;
   dialog.showModal();
   $("release-title").focus();
-  loadReleases();
+  loadReleases({check: target?.kind === "install"});
+}
+
+async function installRelease() {
+  const {target, info, candidate} = releases;
+  if (!target || !info?.canQueue || !candidate || !releases.confirming || releases.pending || releases.queued) return;
+  const seq = ++releases.seq;
+  const install = target.kind === "install";
+  releases.confirming = false;
+  releases.pending = install ? "Готовим установку…" : "Ставим обновление в очередь…";
+  renderReleases();
+  try {
+    const selection = {tag: candidate.tag, channel: info.channel, sha256: candidate.asset.sha256};
+    const data = await api(install ? "fleet/install" : "fleet/upgrade", install ? {...selection, target: target.id}
+      : {...selection, node: target.id, current: info.current}, 18000);
+    if (seq !== releases.seq) return;
+    if (data.tag !== candidate.tag || (install ? data.stage !== "downloading" : data.status !== "queued")) throw new Error();
+    releases.queued = true;
+    releases.tone = "good";
+    releases.message = install ? "Задание принято. Ход установки виден в списке подготовленных нод."
+      : "Обновление в очереди. Ход установки виден в карточке ноды.";
+    loadFleet();
+  } catch (error) {
+    if (seq !== releases.seq) return;
+    if (error.status === 401) return showLogin(true);
+    releases.tone = "warn";
+    releases.message = errorText(error, "Задание не подтверждено. Проверьте карточку ноды.");
+  } finally {
+    if (seq === releases.seq) {
+      releases.pending = "";
+      renderReleases();
+      $("release-check").focus({preventScroll: true});
+    }
+  }
 }
 
 async function verifyReleaseFile(event) {
@@ -1378,12 +1391,24 @@ function clearFleet() {
   fleet.loading = fleet.busy = fleet.fresh = false;
   fleet.nodes = null;
   fleet.key = "";
+  fleet.installTargets = [];
+  fleet.installKey = "";
   fleet.selected.clear();
   fleet.revokeId = null;
+  gpuPower.target = gpuPower.request = null;
+  $("gpu-power-form").reset();
+  text($("gpu-power-device"), "");
+  text($("gpu-power-range"), "");
+  text($("gpu-power-message"), "");
   clearFleetInvite();
   $("fleet-enroll").reset();
   $("fleet-enroll").hidden = true;
   $("node-list").replaceChildren();
+  state.atlasKey = "";
+  $("atlas-node").hidden = true;
+  $("atlas-node").replaceChildren();
+  $("prepared-install").hidden = true;
+  $("prepared-install-targets").replaceChildren();
   text($("fleet-status"), "Проверяем список нод…");
   text($("fleet-message"), "");
 }
@@ -1412,7 +1437,167 @@ function showFleetInvite(data) {
   $("fleet-hide-invite").focus();
 }
 
+function renderPreparedTargets() {
+  const {installTargets, fresh, busy} = fleet;
+  const key = JSON.stringify([installTargets, fresh, busy]);
+  if (fleet.installKey === key) return;
+  fleet.installKey = key;
+  $("prepared-install").hidden = !installTargets.length;
+  const active = installTargets.some(({install}) => ["downloading", "connecting", "waiting"].includes(install?.stage));
+  const labels = {downloading: "Проверяет архив", connecting: "Устанавливается", waiting: "Ждёт первого отчёта",
+    ready: "Нода подключена", failed: "Отказ до установки", unconfirmed: "Требует проверки"};
+  $("prepared-install-targets").replaceChildren(...installTargets.map(target => {
+    const item = create("li");
+    const title = create("div");
+    const label = safeLine(target.label);
+    const stage = target.install?.stage;
+    const kernel = ["6.6", "6.12"].includes(target.kernel) ? ` · ядро ${target.kernel}` : "";
+    title.append(create("strong", label), create("p", `Linux x64${kernel}`, "subline"));
+    item.append(title);
+    const action = create("div", undefined, "panel-actions");
+    if (stage) {
+      const result = create("span", [safeLine(target.install?.tag), labels[stage]].filter(Boolean).join(" · "), "state");
+      result.dataset.tone = stage === "ready" ? "good" : ["failed", "unconfirmed"].includes(stage) ? "warn" : "neutral";
+      action.append(result);
+    }
+    if (!stage || stage === "failed") {
+      const button = create("button", "Выбрать выпуск");
+      button.type = "button";
+      button.disabled = !fresh || busy || active;
+      button.setAttribute("aria-label", `Выбрать выпуск для ${label}`);
+      button.addEventListener("click", () => openReleases({id: target.id, label, kind: "install"}));
+      action.append(button);
+    }
+    item.append(action);
+    return item;
+  }));
+}
+
+function powerRange(device) {
+  const {min, max, current} = device.power_limit || {};
+  if (![min, max, current].every(Number.isFinite) || min < 1 || max > 3000 || current < min || current > max
+      || Math.ceil(min) > Math.floor(max)) return null;
+  return {min: Math.ceil(min), max: Math.floor(max), current};
+}
+
+function openGpuPower(node, device, range) {
+  if (gpuPower.request) return;
+  gpuPower.target = {node: node.id, gpu: device.id, ...range};
+  const input = $("gpu-power-watts");
+  input.min = range.min;
+  input.max = range.max;
+  input.value = Math.min(range.max, Math.max(range.min, Math.round(range.current)));
+  $("gpu-power-send").disabled = false;
+  text($("gpu-power-device"), `${safeLine(node.label)} · ${safeLine(device.label)}`);
+  text($("gpu-power-range"), `Сейчас ${fmt(range.current, "Вт", 1)}. Доступно ${range.min}–${range.max} Вт.`);
+  text($("gpu-power-message"), "");
+  $("gpu-power-dialog").showModal();
+  input.focus();
+}
+
+async function submitGpuPower(event) {
+  event.preventDefault();
+  const target = gpuPower.target;
+  const watts = $("gpu-power-watts").valueAsNumber;
+  if (gpuPower.request || !target || !state.online || !fleet.fresh || state.mode !== "app"
+      || !Number.isSafeInteger(watts) || watts < target.min || watts > target.max) return;
+  const seq = gpuPower.request = {};
+  const visible = () => $("gpu-power-dialog").open && gpuPower.target === target;
+  const button = $("gpu-power-send");
+  const msg = $("gpu-power-message");
+  button.disabled = true;
+  text(msg, "Ставим команду в очередь…");
+  let queued = false;
+  try {
+    const data = await api("fleet/power", {node: target.node, gpu: target.gpu, watts});
+    if (gpuPower.request !== seq) return;
+    if (data.status !== "queued" || data.gpu !== target.gpu || data.watts !== watts) throw new Error();
+    queued = true;
+    if (visible()) text(msg, "Команда принята. Результат появится в карточке ноды.");
+  } catch (error) {
+    if (gpuPower.request !== seq) return;
+    if (error.status === 401) return showLogin(true);
+    if (visible()) text(msg, errorText(error, "Запрос не подтверждён. Проверьте результат в карточке ноды."));
+  } finally {
+    if (gpuPower.request === seq) await loadFleet();
+    if (gpuPower.request === seq) {
+      gpuPower.request = null;
+      if (visible()) button.disabled = queued;
+    }
+  }
+}
+
+function nodeGpuCards(devices, atlas = false, node = null) {
+  const grid = create("div", undefined, "node-gpu-grid");
+  for (const device of devices) {
+    const gpu = create("section", undefined, "node-gpu");
+    const identity = create("div");
+    identity.append(create("h3", safeLine(device.label) || "GPU"), create("p", safeLine(device.id), "subline mono"));
+    if (atlas) {
+      const states = {mining: "Добыча", starting: "Запускается", retrying: "Повтор запуска", stopping: "Останавливается",
+        busy: "Занята", error: "Сбой", paused: "На паузе", idle: "Простой", stopped: "Остановлена"};
+      const label = states[device.state];
+      if (label) identity.append(create("p", label, "subline"));
+    }
+    const readings = create("dl", undefined, "node-gpu-readings");
+    const vram = Number.isFinite(device.memory_used_mib) && Number.isFinite(device.memory_total_mib)
+      ? `${n(device.memory_used_mib, 0)} / ${n(device.memory_total_mib, 0)} МиБ` : "—";
+    const metrics = [["Ядро", temperature(device.edge)], ["Мощность", fmt(device.watts, "Вт", 1)]];
+    metrics.push(...(atlas ? [["Хешрейт", rate(device.rate_hs)], ["Hotspot", temperature(device.hot)]]
+      : [["Загрузка GPU", fmt(device.utilization, "%", 0)], ["Память", vram]]));
+    for (const [label, reading] of metrics) {
+      const pair = create("div");
+      pair.append(create("dt", label), create("dd", reading));
+      readings.append(pair);
+    }
+    gpu.append(identity, readings);
+    const power = powerRange(device);
+    if (power) {
+      const controls = create("div", undefined, "node-gpu-power");
+      controls.append(create("span", `Предел ${fmt(power.current, "Вт", 1)}`, "subline"));
+      if (node?.hardware?.power_control === true && location.protocol === "https:") {
+        const apply = actionButton("Изменить предел", () => openGpuPower(node, device, power), "quiet");
+        const active = ["queued", "sent", "claimed"].includes(node.power_job?.status);
+        apply.dataset.controlKey = `${node.id}:power:${device.id}`;
+        apply.disabled = !fleet.fresh || fleet.busy || !state.online || active;
+        controls.append(apply);
+      }
+      gpu.append(controls);
+    }
+    grid.append(gpu);
+  }
+  return grid;
+}
+
+function renderAtlasNode(atlas) {
+  const section = $("atlas-node");
+  section.hidden = !atlas;
+  const key = JSON.stringify([state.online, atlas]);
+  if (key === state.atlasKey) return;
+  state.atlasKey = key;
+  if (!atlas) {
+    section.replaceChildren();
+    return;
+  }
+  const online = state.online && atlas.status === "online";
+  const card = create("article", undefined, "surface node-card");
+  const heading = create("div", undefined, "panel-head");
+  const identity = create("div");
+  identity.append(create("h2", "Atlas"), create("p", online ? `Последний замер · ${eventTime(atlas.time)}`
+    : "Свежий снимок недоступен."));
+  const badge = create("span", online ? "На связи" : "Нет данных", "state");
+  badge.dataset.tone = online ? "good" : "warn";
+  heading.append(identity, badge);
+  card.append(heading);
+  if (online) {
+    card.append(create("p", `GPU в работе · ${n(atlas.gpu_counts.active, 0)} / ${n(atlas.gpu_counts.total, 0)}`, "subline"),
+      nodeGpuCards(inList(atlas.gpus), true));
+  }
+  section.replaceChildren(card);
+}
+
 function renderFleet() {
+  renderPreparedTargets();
   const rows = inList(fleet.nodes);
   $("fleet-enroll").hidden = !fleet.fresh;
   $("fleet-label").disabled = fleet.busy;
@@ -1440,14 +1625,20 @@ function renderFleet() {
     const time = create("p", Number.isFinite(node.last_seen) ? `Последний контакт: ${eventTime(node.last_seen)}` : "Контакт не зафиксирован.");
     time.dataset.nodeTime = node.id;
     info.append(create("h2", name), time);
+    if (typeof node.release?.version === "string") {
+      info.append(create("p", `Apollo.NEB ${safeLine(node.release.version)}`, "subline"));
+    }
     const [nodeLabel, tone] = NODE_STATES.get(node.status) || ["Состояние неизвестно", "neutral"];
     const mark = create("span", nodeLabel, "state");
     mark.dataset.tone = tone;
     head.append(info, mark);
     card.append(head);
     const workers = inList(node.workers).slice(0, 128);
+    const gpus = inList(node.hardware?.devices).slice(0, 32);
     const commands = inList(node.commands).slice(0, 10);
-    const pending = commands.some(item => item.status === "queued" || item.status === "sent");
+    const upgrade = node.upgrade;
+    const upgradeActive = ["queued", "sent", "preparing", "applying"].includes(upgrade?.status);
+    const pending = upgradeActive || commands.some(item => item.status === "queued" || item.status === "sent");
     const canControl = fleet.fresh && !fleet.busy && node.status === "online" && !pending;
     const selected = fleet.selected.get(node.id) || new Set();
     fleet.selected.set(node.id, selected);
@@ -1487,7 +1678,18 @@ function renderFleet() {
       card.append(list);
       controls.append(start, stop, count);
       setControls();
-    } else card.append(create("p", "Нода ещё не сообщила о воркерах.", "subline"));
+    } else if (node.release?.platform === "windows") {
+      card.append(create("p", gpus.length ? "Мониторинг GPU" : "Датчики GPU недоступны.", "subline"));
+      if (gpus.length) card.append(nodeGpuCards(gpus, false, node));
+    } else {
+      card.append(create("p", "Нода ещё не сообщила о воркерах.", "subline"));
+    }
+    if (node.status === "online" && node.release?.version) {
+      const updates = actionButton("Выпуски", () => openReleases({id: node.id, label: name}), "quiet");
+      updates.dataset.controlKey = node.id + ":releases";
+      updates.disabled = !fleet.fresh || fleet.busy;
+      controls.append(updates);
+    }
     if (node.status !== "revoked" && node.status !== "expired") {
       const revoke = actionButton("Отозвать доступ", () => {
         fleet.revokeId = node.id;
@@ -1499,6 +1701,21 @@ function renderFleet() {
       controls.append(revoke);
     }
     card.append(controls);
+    if (node.power_job) {
+      const labels = {queued: "В очереди", sent: "Передано", claimed: "Проверяется на ноде", applied: "Предел подтверждён",
+        refused: "Отклонено нодой", unknown: "Результат неизвестен", expired: "Срок истёк", cancelled: "Отменено"};
+      const job = node.power_job;
+      const detail = safeLine(job.gpu) || "GPU";
+      const label = labels[job.status] || "Состояние неизвестно";
+      card.append(create("p", `${detail} · ${fmt(job.watts, "Вт", 0)} · ${label}`, "subline"));
+    }
+    if (upgrade) {
+      const labels = {queued: "В очереди", sent: "Передано", preparing: "Проверяет пакет", applying: "Устанавливается",
+        installed: "Установлено", rolled_back: "Восстановлена прежняя версия", failed: "Ошибка установки",
+        expired: "Срок задания истёк", unknown: "Итог не подтверждён", cancelled: "Отменено"};
+      const label = labels[upgrade.status];
+      if (label) card.append(create("p", `Обновление ${safeLine(upgrade.tag)} · ${label}`, "subline"));
+    }
     if (commands.length) {
       const details = create("details");
       details.dataset.nodeCommands = node.id;
@@ -1507,7 +1724,7 @@ function renderFleet() {
       const list = create("ul", undefined, "result-list");
       for (const command of commands) {
         const status = COMMAND_STATES.get(command.status) || "Статус неизвестен";
-        const action = command.action === "stop" ? "Остановка" : "Запуск";
+        const action = {start: "Запуск", stop: "Остановка", restart: "Перезапуск"}[command.action] || "Команда";
         const identities = inList(command.workers).map(id => workers.find(worker => worker.id === id)?.label || id).join(", ");
         const warning = command.status === "unknown" ? " Не повторяйте без проверки состояния воркеров." : "";
         const li = create("li", `${action}: ${identities || "—"} · ${status}.${warning}`);
@@ -1534,6 +1751,8 @@ async function loadFleet() {
     if (generation !== fleet.generation || authEpoch !== state.authEpoch) return;
     if (!Array.isArray(data.nodes)) throw new Error();
     fleet.nodes = data.nodes;
+    fleet.installTargets = inList(data.install_targets).slice(0, 16).filter(
+      row => row && /^neb-[a-z0-9][a-z0-9-]{0,39}$/.test(row.id) && safeLine(row.label));
     fleet.fresh = true;
   } catch (error) {
     if (generation !== fleet.generation || authEpoch !== state.authEpoch) return;
@@ -1584,10 +1803,12 @@ async function changeFleet(kind, body) {
   }
 }
 
-function openProfile(address) {
+function openProfile() {
   if (!state.online || !state.status || !hasCapability("local_workers") || $("profile-dialog").open) return;
   const {profile, pools} = state.status;
-  $("wallet").value = typeof address === "string" ? address : profile?.wallet || "";
+  $("wallet").value = "";
+  $("wallet").required = profile?.wallet_configured !== true;
+  text($("wallet-hint"), $("wallet").required ? "" : "Оставьте поле пустым, чтобы сохранить текущий адрес.");
   $("worker-name").value = profile?.worker || "";
   $("pool").replaceChildren(...inList(pools).map(pool => {
     const option = create("option", pool.label || pool.id);
@@ -1629,9 +1850,10 @@ for (const kind of ["profile", "limits"]) {
     if (submit.disabled) return;
     if (!state.online) return text(msg, "Нет связи с панелью. Повторите после переподключения.");
     const data = kind === "profile"
-      ? {wallet: $("wallet").value.trim(), worker: $("worker-name").value.trim(), pool: $("pool").value}
+      ? {worker: $("worker-name").value.trim(), pool: $("pool").value}
       : {edge_limit: $("edge-limit").valueAsNumber, hot_limit: $("hot-limit").valueAsNumber,
         hbm_limit: $("hbm-limit").value === "" ? null : $("hbm-limit").valueAsNumber, ack: $("limits-ack").checked};
+    if (kind === "profile" && $("wallet").value.trim()) data.wallet = $("wallet").value.trim();
     if (kind === "limits" && !data.ack) return;
     if (kind === "limits" && data.edge_limit > data.hot_limit) return text(msg, "Предел ядра не может превышать предел hotspot.");
     const generation = state.generation;
@@ -1660,20 +1882,32 @@ $("limits-form").addEventListener("input", event => {
   $("limits-save").disabled = !$("limits-ack").checked;
 });
 
+$("unlock").addEventListener("click", () => {
+  if (state.mode !== "login" || $("login").open) return;
+  $("login").showModal();
+  refreshAuthInfo();
+  $("password").focus();
+});
+$("login").addEventListener("cancel", event => {
+  if ($("login-form").querySelector('button[type="submit"]').disabled) event.preventDefault();
+});
+$("login").addEventListener("close", () => $("login-form").reset());
+
 $("login-form").addEventListener("submit", async event => {
   event.preventDefault();
   const btn = event.currentTarget.querySelector("button");
   if (btn.disabled) return;
   const pass = $("password");
   const code = $("login-code");
-  btn.disabled = pass.disabled = code.disabled = true;
+  const dismiss = $("login").querySelector("[data-close]");
+  btn.disabled = pass.disabled = code.disabled = dismiss.disabled = true;
   text($("login-message"), "Проверяем данные…");
   try {
     await api("login", {password: pass.value, code: code.value.trim()});
     pass.value = code.value = "";
     state.generation++;
     state.mode = "boot";
-    $("login").hidden = true;
+    $("login").close();
     $("boot").hidden = false;
     text($("boot-message"), "Ожидаем ответ локальной службы…");
     await refreshStatus({fresh: true});
@@ -1684,8 +1918,8 @@ $("login-form").addEventListener("submit", async event => {
     text($("login-message"), error.status === 401 ? "Неверный пароль или код."
       : errorText(error, "Не удалось войти."));
   } finally {
-    btn.disabled = pass.disabled = code.disabled = false;
-    if (!$("login").hidden) pass.focus();
+    btn.disabled = pass.disabled = code.disabled = dismiss.disabled = false;
+    if ($("login").open) pass.focus();
   }
 });
 
@@ -1709,7 +1943,6 @@ for (const button of all("[data-limits]")) button.addEventListener("click", open
 for (const button of all("[data-close]")) button.addEventListener("click", () => {
   const dialog = button.closest("dialog");
   if (dialog.id === "totp-dialog") clearTotp();
-  if (dialog.id === "wallets-dialog") resetWalletForms();
   dialog.close();
 });
 for (const button of all("[data-setup]")) button.addEventListener("click", () => {
@@ -1734,13 +1967,11 @@ for (const button of all("[data-copy]")) button.addEventListener("click", async 
 });
 
 for (const button of all("[data-totp]")) button.addEventListener("click", openTotp);
-for (const button of all("[data-wallets]")) button.addEventListener("click", openWallets);
 for (const button of all("[data-discovery]")) button.addEventListener("click", openDiscovery);
-for (const id of ["totp-dialog", "wallets-dialog", "discovery-dialog"]) {
+for (const id of ["totp-dialog", "discovery-dialog"]) {
   $(id).addEventListener("cancel", event => {
     if ($(id).dataset.busy === "true") event.preventDefault();
     else if (id === "totp-dialog") clearTotp();
-    else if (id === "wallets-dialog") resetWalletForms();
   });
 }
 $("totp-dialog").addEventListener("close", () => { if (!$("totp-dialog").open) clearTotp(); });
@@ -1759,60 +1990,6 @@ $("totp-recovery-copy").addEventListener("click", () => {
 });
 $("totp-recovery-download").addEventListener("click", () => {
   if ($("totp-dialog").open && !$("totp-recovery").hidden) downloadRecoveryCodes($("totp-codes"));
-});
-
-$("wallets-dialog").addEventListener("close", () => {
-  if ($("wallets-dialog").open) return;
-  vault.seq++;
-  vault.busy = false;
-  setAuxBusy("wallets-dialog", false);
-  resetWalletForms();
-  text($("wallets-message"), "");
-});
-$("wallets-refresh").addEventListener("click", loadWallets);
-$("wallets-install").addEventListener("click", () => walletMutation("wallets/install", {}, "Запрашиваем загрузку проверенного модуля…", data => {
-  if (typeof data.available !== "boolean") throw new Error();
-  vault.data = data;
-  renderWallets();
-  text($("wallets-message"), vault.data.available ? "Модуль кошелька установлен." : "Загрузка запрошена. Статус можно обновить после проверки файла.");
-}));
-$("wallet-new").addEventListener("click", () => {
-  resetWalletForms();
-  text($("wallets-message"), "");
-  $("wallet-create").hidden = false;
-  $("wallet-label").focus();
-});
-for (const button of all("[data-wallet-cancel]")) button.addEventListener("click", () => {
-  resetWalletForms();
-  text($("wallets-message"), "");
-  ($("wallet-new").hidden ? $("wallets-refresh") : $("wallet-new")).focus();
-});
-$("wallet-create").addEventListener("submit", event => {
-  event.preventDefault();
-  if (vault.busy || !vault.data?.available) return;
-  const label = $("wallet-label").value.trim();
-  const password = $("wallet-create-password").value;
-  if (!label) return text($("wallets-message"), "Введите название кошелька.");
-  if (password !== $("wallet-create-repeat").value) return text($("wallets-message"), "Пароли не совпадают.");
-  $("wallet-create-password").value = $("wallet-create-repeat").value = "";
-  walletMutation("wallets/create", {label, password}, "Создаём кошелёк…", data => {
-    if (typeof data.id !== "string" || typeof data.address !== "string") throw new Error();
-    resetWalletForms();
-    vault.data = {...vault.data, items: [...inList(vault.data?.items).filter(item => item.id !== data.id), data]};
-    renderWallets();
-    text($("wallets-message"), "Кошелёк создан. Скачайте зашифрованную резервную копию.");
-  });
-});
-$("wallet-export").addEventListener("submit", event => {
-  event.preventDefault();
-  if (vault.busy || !vault.exportId) return;
-  const password = $("wallet-export-password").value;
-  $("wallet-export-password").value = "";
-  walletMutation("wallets/export", {id: vault.exportId, password}, "Готовим зашифрованную копию…", data => {
-    saveEncryptedBackup(data);
-    resetWalletForms();
-    text($("wallets-message"), "Зашифрованный файл передан браузеру. Сохраните его и пароль отдельно.");
-  });
 });
 
 $("discovery-dialog").addEventListener("close", () => {
@@ -1848,14 +2025,45 @@ $("group-clear").addEventListener("click", () => {
   renderGroup(rows);
 });
 for (const action of ["start", "stop"]) $(`group-${action}`).addEventListener("click", () => groupAction(action));
-$("release-open").addEventListener("click", openReleases);
+$("release-open").addEventListener("click", () => openReleases());
 $("release-check").addEventListener("click", () => loadReleases({check: Boolean(releases.info)}));
+$("release-version").addEventListener("change", () => {
+  const target = releases.versions.find(release => release.tag === $("release-version").value);
+  if (!target || target === releases.candidate) return;
+  setReleaseCandidate(target);
+  renderReleases();
+});
 $("release-channels").addEventListener("change", event => {
   const channel = event.target.value;
-  if (RELEASE_CHANNELS.has(channel) && channel !== releases.info?.channel) loadReleases({channel});
+  if (RELEASE_CHANNELS.has(channel) && channel !== releases.info?.channel) {
+    loadReleases({channel, check: Boolean(releases.target)});
+  }
 });
 $("release-file").addEventListener("change", verifyReleaseFile);
+$("release-apply").addEventListener("click", () => {
+  releases.confirming = true;
+  renderReleases();
+  $("release-confirm-submit").focus();
+});
+$("release-confirm-cancel").addEventListener("click", () => {
+  releases.confirming = false;
+  renderReleases();
+  $("release-apply").focus();
+});
+$("release-confirm-submit").addEventListener("click", installRelease);
+$("gpu-power-form").addEventListener("submit", submitGpuPower);
+$("gpu-power-dialog").addEventListener("close", () => {
+  gpuPower.target = null;
+});
 $("fleet-refresh").addEventListener("click", loadFleet);
+$("fleet-copy-key").addEventListener("click", () => {
+  if ($("fleet-invite").hidden) return;
+  const id = $("fleet-invite-id").textContent;
+  const code = $("fleet-invite-code").textContent;
+  if (/^[a-f0-9]{24}$/.test(id) && /^[A-Za-z0-9_-]{24}$/.test(code)) {
+    copySensitive(`${id}.${code}`, $("fleet-message"), () => !$("fleet-invite").hidden);
+  }
+});
 $("fleet-hide-invite").addEventListener("click", clearFleetInvite);
 $("fleet-copy").addEventListener("click", () => {
   const command = $("fleet-invite-command").textContent;
@@ -1876,6 +2084,11 @@ $("fleet-revoke-form").addEventListener("submit", event => {
 
 $("period").addEventListener("change", () => {
   state.historyError = "";
+  drawHistory();
+  refreshTimeline();
+});
+$("history-source").addEventListener("change", () => {
+  applyHistorySource();
   drawHistory();
   refreshTimeline();
 });
@@ -1928,4 +2141,5 @@ setInterval(() => {
   if (!document.hidden && $("discovery-dialog").open && inList(setup.data?.miners).some(miner => miner.state === "downloading")) loadDiscovery();
 }, 3000);
 refreshAuthInfo();
-refreshStatus();
+if (window.location.pathname === "/view") showLogin();
+else refreshStatus();

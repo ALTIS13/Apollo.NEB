@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 
 import neb_app
 import neb_core
+import neb_fleet
 import neb_release as ota
 
 
@@ -112,6 +113,22 @@ class MetadataFallbackTests(unittest.TestCase):
 
 
 class ReleaseCatalogTests(unittest.TestCase):
+    def test_native_windows_archive_uses_its_full_tag_and_separate_size_limit(self):
+        tag = "v1.2.0-rc.1"
+        linux = release(tag)
+        controller = release(tag, "windows-x64.zip")["assets"][0]
+        native_name = "apollo-neb-desktop-1.2.0-rc.1-windows-x64.zip"
+        desktop = {**controller, "name": native_name, "size": 92_022_955,
+                   "browser_download_url": f"{ota.RELEASES}/download/{tag}/{native_name}"}
+        linux["assets"].extend([controller, desktop])
+        native = ota.select([linux], platform="windows-desktop", channel="testing")
+        self.assertEqual(native.name, native_name)
+        self.assertEqual(native.asset.size, 92_022_955)
+        self.assertEqual(ota.select([linux], platform="windows", channel="testing").name, controller["name"])
+        desktop["size"] = ota.MAX_DESKTOP_DOWNLOAD + 1
+        self.assertIsNone(ota.select([linux], platform="windows-desktop", channel="testing"))
+        self.assertEqual(ota.select([linux], platform="linux", channel="testing").tag, tag)
+
     def test_channel_orders_rc_numerically_and_selects_only_matching_platform(self):
         sources = [release("v1.0.0"), release("v1.1.0-rc.2"), release("v1.1.0-rc.10"),
                    release("v2.0.0-rc.1", "windows-x64.zip")]
@@ -201,6 +218,94 @@ class ReleaseCatalogTests(unittest.TestCase):
             fetch.assert_not_called()
 
 
+class ReleaseVersionsTests(unittest.TestCase):
+    def test_lists_strictly_newer_stable_releases_in_numeric_order(self):
+        current = release("v1.2.0")
+        newest = {**release("v1.10.0"), "body": "First change.\nSecond\x1b change."}
+        intermediate = release("v1.9.0")
+        draft = {**release("v1.21.0"), "draft": True}
+        unverified = release("v1.20.0")
+        unverified["assets"][0]["digest"] = None
+        items = [intermediate, current, release("v1.1.0"), draft, newest,
+                 release("v1.32.0-rc.1"), release("v2.0.0", "windows-x64.zip"), unverified, newest]
+        with patch.object(ota, "records", return_value=items), patch.object(ota, "download") as download:
+            versions = ota.Releases(platform="linux").versions(current="1.2.0")
+        self.assertEqual([item["tag"] for item in versions], ["v1.10.0", "v1.9.0"])
+        self.assertEqual(versions[0], {
+            "tag": "v1.10.0",
+            "release_url": "https://github.com/ALTIS13/Apollo.NEB/releases/tag/v1.10.0",
+            "published_at": "2027-02-21T12:00:00Z",
+            "notes": "First change.\nSecond change.",
+            "asset": {
+                "name": "apollo-neb-1.10.0-linux.tar.gz",
+                "url": "https://github.com/ALTIS13/Apollo.NEB/releases/download/v1.10.0/apollo-neb-1.10.0-linux.tar.gz",
+                "sha256": "a" * 64, "size": 100,
+            },
+        })
+        download.assert_not_called()
+
+    def test_uses_persisted_testing_channel_for_windows_and_respects_explicit_channel(self):
+        items = [release("v1.1.0-rc.2", "windows-x64.zip"),
+                 release("v1.1.0-rc.10", "windows-x64.zip"),
+                 release("v1.1.0-rc.20"), release("v1.2.0", "windows-x64.zip")]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ota, "records", return_value=items):
+            config = Path(tmp)
+            releases = ota.Releases(platform="linux")
+            releases.set_channel(config, "testing")
+            testing = releases.versions(config, current="1.1.0-rc.1", platform="windows")
+            stable = releases.versions(config, current="1.1.0-rc.1", platform="windows", channel="stable")
+            self.assertEqual(ota.read_channel(config), "testing")
+        self.assertEqual([item["tag"] for item in testing], ["v1.1.0-rc.10", "v1.1.0-rc.2"])
+        self.assertTrue(all(item["asset"]["name"].endswith("-windows-x64.zip") for item in testing))
+        self.assertEqual([item["tag"] for item in stable], ["v1.2.0"])
+
+    def test_picks_verified_kernel_variant_per_release_and_falls_back_to_generic(self):
+        newest = release("v1.3.0")
+        newest["assets"] += [
+            release("v1.3.0", f"linux-x64-kernel-{family}.tar.gz")["assets"][0]
+            for family in ("6.6", "6.12")
+        ]
+        intermediate = release("v1.2.0")
+        invalid_variant = release("v1.2.0", "linux-x64-kernel-6.6.tar.gz")["assets"][0]
+        invalid_variant["browser_download_url"] = "https://foreign.fixture.invalid/file"
+        intermediate["assets"].append(invalid_variant)
+        old = release("v1.1.0", "linux-x64-kernel-6.12.tar.gz")
+        with patch.object(ota, "records", return_value=[intermediate, old, newest]) as fetch:
+            releases = ota.Releases(platform="linux", kernel="6.12")
+
+            def assets(**target):
+                return [item["asset"]["name"] for item in releases.versions(current="1.0.0", **target)]
+
+            self.assertEqual(assets(), ["apollo-neb-1.3.0-linux-x64-kernel-6.12.tar.gz",
+                                       "apollo-neb-1.2.0-linux.tar.gz", "apollo-neb-1.1.0-linux-x64-kernel-6.12.tar.gz"])
+            self.assertEqual(assets(platform="linux", kernel="6.6"), ["apollo-neb-1.3.0-linux-x64-kernel-6.6.tar.gz",
+                                                                       "apollo-neb-1.2.0-linux.tar.gz"])
+            self.assertEqual(assets(platform="linux"), ["apollo-neb-1.3.0-linux.tar.gz", "apollo-neb-1.2.0-linux.tar.gz"])
+            fetch.assert_called_once_with()
+
+    def test_shares_status_cache_and_distinguishes_no_updates_from_unavailable_catalog(self):
+        with patch.object(ota, "VERSION", "1.0.0"), patch.object(ota, "records", return_value=[release("v1.1.0")]) as fetch:
+            releases = ota.Releases(platform="linux")
+            self.assertEqual(releases.status()["latest"], "v1.1.0")
+            self.assertEqual([item["tag"] for item in releases.versions()], ["v1.1.0"])
+            self.assertEqual(releases.versions(current="1.1.0"), [])
+            fetch.assert_called_once_with()
+        with patch.object(ota, "records", side_effect=ValueError("Каталог недоступен.")) as fetch:
+            releases = ota.Releases(platform="linux")
+            self.assertEqual(releases.status()["state"], "unavailable")
+            with self.assertRaisesRegex(ValueError, "Каталог недоступен"):
+                releases.versions(current="1.0.0")
+            fetch.assert_called_once_with()
+
+    def test_invalid_current_and_unsupported_target_do_not_fetch_catalog(self):
+        with patch.object(ota, "records") as fetch:
+            releases = ota.Releases(platform="linux")
+            with self.assertRaises(ValueError):
+                releases.versions(current="invalid")
+            self.assertEqual(releases.versions(current="1.0.0", platform="unsupported"), [])
+            fetch.assert_not_called()
+
+
 class ReleaseInstallTests(unittest.TestCase):
     def test_only_a_verified_archive_with_matching_version_reaches_the_existing_installer(self):
         tag = "v1.2.0-rc.2"
@@ -253,6 +358,73 @@ class ReleaseInstallTests(unittest.TestCase):
 
 
 class ReleaseRoutesTests(unittest.TestCase):
+    def test_node_catalog_uses_fresh_node_target_and_operator_session(self):
+        target = {"version": "0.8.0", "platform": "linux", "arch": "x64", "kernel": "6.6", "upgrade": True}
+        catalog = [release("v0.9.0", "linux-x64-kernel-6.6.tar.gz"), release("v0.9.0", "windows-x64.zip"),
+                   release("v0.9.1-rc.1", "linux-x64-kernel-6.6.tar.gz")]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ota, "records", return_value=catalog):
+            root = Path(tmp)
+            registry = neb_fleet.Fleet(root / "fleet.sqlite")
+            invite = registry.enroll("Node release fixture")
+            node, key = invite["id"], "a" * 43
+            registry.pair(node, invite["code"], key)
+            registry.poll(node, key, [], [], release=target)
+            service = SimpleNamespace(config=root / "config", releases=ota.Releases(platform="windows"), fleet=registry)
+            password = "node release route fixture"
+            auth = neb_core.Auth(neb_core.new_login(password), root / "auth.sqlite")
+            with neb_app.Server(("127.0.0.1", 0), service, auth, neb_app.HERE / "web", None) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                route = f"/api/fleet/releases?node={node}"
+                try:
+                    with closing(http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)) as conn:
+                        def get(path, cookie=None):
+                            conn.request("GET", path, headers={} if cookie is None else {"Cookie": f"neb_sid={cookie}"})
+                            response = conn.getresponse()
+                            return response.status, json.loads(response.read())
+
+                        self.assertEqual(get(route)[0], 401)
+                        session = auth.enter(password, "")
+                        code, data = get(route, session)
+                        self.assertEqual(code, 200)
+                        self.assertEqual(data["current"], "0.8.0")
+                        self.assertEqual(data["platform"], "linux")
+                        self.assertFalse(data["can_apply"])
+                        self.assertTrue(data["can_queue"])
+                        self.assertEqual([item["tag"] for item in data["versions"]], ["v0.9.0"])
+                        self.assertEqual(data["versions"][0]["asset"]["name"], "apollo-neb-0.9.0-linux-x64-kernel-6.6.tar.gz")
+                        self.assertEqual(data["versions"][0]["notes"], catalog[0]["body"])
+                        self.assertEqual([item["tag"] for item in get(route + "&channel=testing", session)[1]["versions"]],
+                                         ["v0.9.1-rc.1"])
+                        self.assertEqual(get(route + "&check=0", session)[1]["state"], "unchecked")
+                        self.assertEqual(get(route + "&node=" + node, session)[0], 400)
+                        self.assertEqual(get(route.replace(node, "a" * 24), session)[0], 409)
+
+                        origin = f"http://127.0.0.1:{server.server_port}"
+                        selection = {"node": node, "current": "0.8.0", "tag": "v0.9.0",
+                                     "channel": "stable", "sha256": "a" * 64}
+
+                        def post(payload, *, cookie=None, ref=origin):
+                            headers = {"Origin": ref, "Content-Type": "application/json"}
+                            if cookie:
+                                headers["Cookie"] = f"neb_sid={cookie}"
+                            conn.request("POST", "/api/fleet/upgrade", json.dumps(payload), headers)
+                            response = conn.getresponse()
+                            return response.status, json.loads(response.read())
+
+                        self.assertEqual(post(selection)[0], 401)
+                        self.assertEqual(post(selection, cookie=session, ref="https://fixture.invalid")[0], 403)
+                        self.assertEqual(post({**selection, "sha256": "b" * 64}, cookie=session)[0], 409)
+                        self.assertEqual(post({**selection, "current": "0.7.1"}, cookie=session)[0], 409)
+                        self.assertIsNone(registry.upgrade_poll(node, key)["job"])
+                        accepted, queued = post(selection, cookie=session)
+                        self.assertEqual(accepted, 202)
+                        self.assertEqual(queued["status"], "queued")
+                        self.assertEqual(registry.upgrade_poll(node, key)["job"]["id"], queued["id"])
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=3)
+
     def test_check_and_stream_switch_require_owner_session_and_same_origin_post(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(ota, "records", return_value=[]) as fetch:
             root = Path(tmp)

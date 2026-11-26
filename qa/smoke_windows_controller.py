@@ -77,7 +77,9 @@ def exercise(launcher, directory):
             assert code == 200 and "HttpOnly; SameSite=Strict" in cookie_header
             cookie = cookie_header.split(";", 1)[0]
             status = request(port, "GET", "/api/status", cookie=cookie)[1]
-            assert status["capabilities"] == {"local_workers": False, "wallet_tools": False}
+            capabilities = status["capabilities"]
+            assert capabilities["local_workers"] is False
+            assert capabilities["wallet_tools"] is False
             assert status["workers"] == []
             assert request(port, "GET", "/api/setup", cookie=cookie)[0] == 404
             assert request(port, "POST", "/api/start", {"id": "qa-worker"}, cookie)[0] == 409

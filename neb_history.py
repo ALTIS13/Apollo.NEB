@@ -55,12 +55,15 @@ class Archive:
     def connect(self):
         return sqlite3.connect(self.path, timeout=4)
 
+    @staticmethod
+    def _record_sample(db, at, sample):
+        db.execute("INSERT OR IGNORE INTO trend VALUES (?,?,?,?,?,?,?,?,?)", (at // SAMPLE, at, *sample))
+        db.execute("DELETE FROM trend WHERE slot<?", ((at - RETAIN) // SAMPLE,))
+
     def tick(self, at, workers, events, *, limits=None):
         cutoff = at - RETAIN
         with closing(self.connect()) as db, db:
-            db.execute("INSERT OR IGNORE INTO trend VALUES (?,?,?,?,?,?,?,?,?)",
-                       (at // SAMPLE, at, *observations(workers)))
-            db.execute("DELETE FROM trend WHERE slot<?", (cutoff // SAMPLE,))
+            self._record_sample(db, at, observations(workers))
             if limits is not None:
                 settings = tuple(limits[key] for key in LIMIT_FIELDS)
                 previous = db.execute("SELECT edge_limit, hot_limit, hbm_limit FROM threshold"
@@ -70,6 +73,24 @@ class Archive:
             # Keep the settings at the retention boundary as well as newer changes.
             db.execute("DELETE FROM threshold WHERE t<(SELECT MAX(t) FROM threshold WHERE t<=?)", (cutoff,))
             self._record_events(db, cutoff, events)
+
+    def farm_sample(self, at, overview):
+        """Record a farm observation only when every configured source is online."""
+        nodes = overview["nodes"]
+        with closing(self.connect()) as db, db:
+            if not nodes["total"] or nodes["online"] != nodes["total"]:
+                db.execute("DELETE FROM trend WHERE slot<?", ((at - RETAIN) // SAMPLE,))
+                return
+            rate = overview["hashrate_hs"] / 1e6 if overview["hashrate_hs"] is not None else None
+            watts = overview["watts"]
+            temperatures = overview["temperatures"]
+            self._record_sample(db, at, (rate, watts, temperatures["edge"], temperatures["hot"],
+                                         temperatures["hbm"], overview["workers"]["running"],
+                                         rate / watts if rate is not None and watts else None))
+
+    def has_samples(self):
+        with closing(self.connect()) as db:
+            return db.execute("SELECT 1 FROM trend LIMIT 1").fetchone() is not None
 
     def note_start(self, at, *, boot_id=None, reboot_at=None):
         identity = boot_id.strip() if isinstance(boot_id, str) else ""

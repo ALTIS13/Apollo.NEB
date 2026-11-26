@@ -13,6 +13,7 @@
   <script src="/recovery-codes.js" defer></script>
   <script src="/history-chart.js" defer></script>
   <script src="/select-menu.js" defer></script>
+  <script src="/view.js" defer></script>
   <script src="/ui.js" defer></script>
 </head>
 <body>
@@ -45,20 +46,54 @@
       <p id="boot-message" role="status">Ожидаем ответ локальной службы…</p>
       <button type="button" id="retry" hidden>Повторить</button>
     </section>
-    <section id="login" class="gate surface" hidden>
-      <span class="tile-icon"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg></span>
-      <h1>Вход в Apollo.NEB</h1>
-      <p>Введите пароль администратора, заданный при настройке панели.</p>
-      <form id="login-form">
-        <label>Пароль<input id="password" type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>
-        <label id="login-code-row" for="login-code" hidden>Код 2FA или резервный код
-          <span id="login-code-hint" class="subline">Код из приложения или один сохранённый резервный код</span>
-          <input id="login-code" name="code" autocomplete="one-time-code" maxlength="80" spellcheck="false" autocapitalize="none" aria-describedby="login-code-hint">
-        </label>
-        <button class="primary" type="submit">Войти</button>
-        <p id="login-message" class="form-message" role="status"></p>
-      </form>
-      <p class="panel-actions"><a href="/view">Смотреть состояние без входа</a></p>
+    <section id="public-overview" class="public-main" aria-labelledby="view-title" hidden>
+      <div class="page-header">
+        <div>
+          <h1 id="view-title">Обзор фермы</h1>
+          <div class="public-freshness">
+            <span class="connection" id="view-connection" data-tone="neutral">
+              <i aria-hidden="true"></i><span id="view-connection-label" role="status">Загружаем показатели…</span>
+            </span>
+            <time class="mono muted" id="view-time" hidden></time>
+            <span class="mono muted" id="view-nodes" hidden></span>
+          </div>
+        </div>
+        <button class="primary" type="button" id="unlock" aria-haspopup="dialog">
+          <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Разблокировать управление
+        </button>
+      </div>
+
+      <dl class="surface summary" aria-label="Сводка фермы">
+        <div><dt>Хешрейт</dt><dd id="view-hashrate">—</dd></div>
+        <div><dt>Потребление GPU</dt><dd id="view-watts">—</dd></div>
+        <div><dt>Воркеры в работе</dt><dd id="view-workers">—</dd></div>
+        <div><dt>Требуют внимания</dt><dd id="view-attention">—</dd></div>
+      </dl>
+
+      <div class="public-details">
+        <section class="surface" aria-labelledby="view-thermal-title">
+          <h2 id="view-thermal-title">Температура GPU</h2>
+          <dl class="sensor-list">
+            <div><dt>Ядро</dt><dd id="view-edge">—</dd></div>
+            <div><dt>Hotspot</dt><dd id="view-hot">—</dd></div>
+            <div><dt>Память</dt><dd id="view-hbm">—</dd></div>
+          </dl>
+        </section>
+        <section class="surface" aria-labelledby="view-shares-title">
+          <h2 id="view-shares-title">Шары</h2>
+          <dl class="sensor-list">
+            <div><dt>Приняты</dt><dd id="view-accepted">—</dd></div>
+            <div><dt>Отклонены</dt><dd id="view-rejected">—</dd></div>
+          </dl>
+        </section>
+        <section class="surface" aria-labelledby="view-devfee-title">
+          <h2 id="view-devfee-title">DevFee</h2>
+          <dl class="sensor-list">
+            <div><dt>Состояние</dt><dd id="view-devfee-state">—</dd></div>
+            <div><dt>Доля активного времени</dt><dd id="view-devfee-share">—</dd></div>
+          </dl>
+        </section>
+      </div>
     </section>
     <div id="app" hidden>
       <div class="page-header">
@@ -68,7 +103,6 @@
         </div>
         <div class="page-actions">
           <button type="button" data-totp><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Защита входа</button>
-          <button type="button" data-wallets>Кошельки</button>
           <button type="button" id="profile-open" class="profile-button"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>Профиль пула</button>
         </div>
       </div>
@@ -91,7 +125,7 @@
           </div>
           <ol class="steps">
             <li><span class="step-number">01</span><div><h3 id="step-auth-title">Защитите вход с помощью 2FA</h3><p>Необязательный шаг для локальной панели: подтвердите пароль и подключите приложение-аутентификатор.</p></div><button type="button" data-totp aria-label="Настройка 2FA">Настройка 2FA</button></li>
-            <li><span class="step-number">02</span><div><h3 id="step-profile-title">Задайте профиль пула</h3><p>Укажите существующий публичный адрес NEB или создайте кошелёк в панели. Приватный ключ и seed-фраза не нужны.</p></div><button type="button" class="primary" data-profile><span id="step-profile-action">Настроить профиль</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button></li>
+            <li><span class="step-number">02</span><div><h3 id="step-profile-title">Задайте профиль пула</h3><p>Укажите адрес выплат NEB Mainnet и выберите пул.</p></div><button type="button" class="primary" data-profile><span id="step-profile-action">Настроить профиль</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button></li>
             <li><span class="step-number">03</span><div><h3 id="step-workers-title">Добавьте воркеры</h3><p>Выберите обнаруженные GPU. Добавление воркеров не запускает майнинг.</p></div><button type="button" data-discovery>Найти устройства</button></li>
           </ol>
           <p id="setup-support" class="support-note"></p>
@@ -105,6 +139,7 @@
           <div><h2 id="attention-title">Требует внимания</h2><p id="attention-detail"></p></div>
           <button type="button" data-go="workers">К воркерам<svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button>
         </section>
+        <p class="subline" id="overview-coverage" hidden></p>
         <dl class="summary surface" aria-label="Текущая сводка">
           <div><dt>Воркеры в работе</dt><dd id="live-workers">—</dd></div>
           <div><dt>Хешрейт</dt><dd id="live-rate">—</dd></div>
@@ -113,10 +148,11 @@
         </dl>
         <div class="overview-grid">
           <section class="surface history" aria-labelledby="history-title">
-            <div class="panel-head"><div><h2 id="history-title">История фермы</h2><p>Локальные измерения</p></div><span class="mono muted" id="history-count"></span></div>
+            <div class="panel-head"><h2 id="history-title">Локальная история</h2><span class="mono muted" id="history-count"></span></div>
             <div class="chart-controls">
-              <label>Период <select id="period"><option value="30m">30 минут</option><option value="6h">6 часов</option><option value="24h">24 часа</option><option value="7d">7 дней</option><option value="31d">31 день</option></select></label>
-              <label>Метрика <select id="metric"><option value="rate">Хешрейт</option><option value="watts">Потребление GPU</option><option value="edge">Ядро · средняя</option><option value="hot">Hotspot · максимум</option><option value="hbm">Память · средняя</option><option value="active">Активные воркеры</option><option value="efficiency">Эффективность GPU</option></select></label>
+              <label id="history-source-row" hidden>Источник <select id="history-source"><option value="local">Эта установка</option><option id="history-farm-option" value="farm" hidden>Вся ферма</option><option id="history-atlas-option" value="atlas" hidden>Atlas</option></select></label>
+              <label>Период <select id="period"><option value="30m">30 минут</option><option value="6h">6 часов</option><option value="24h">24 часа</option><option value="7d">7 дней</option><option id="history-max-period" value="31d">31 день</option></select></label>
+              <label>Метрика <select id="metric"><option value="rate">Хешрейт</option><option value="watts">Потребление GPU</option><option id="history-edge-metric" value="edge">Ядро · средняя</option><option value="hot">Hotspot · максимум</option><option id="history-memory-metric" value="hbm">Память · средняя</option><option id="history-active-metric" value="active">Активные воркеры</option><option value="efficiency">Эффективность GPU</option></select></label>
             </div>
             <div id="chart-wrap" class="chart-wrap">
               <svg id="chart-svg" role="group" aria-label="История хешрейта" aria-describedby="chart-caption"></svg>
@@ -171,7 +207,7 @@
       </section>
       <section id="nodes" hidden>
         <section class="surface node-join" aria-labelledby="node-join-title">
-          <div class="panel-head"><div><h2 id="node-join-title">Подключить ноду</h2><p>Нода сама подключается к этой панели и передаёт только состояние воркеров. Пара не включает майнинг автоматически.</p></div><button type="button" id="fleet-refresh">Обновить</button></div>
+          <div class="panel-head"><div><h2 id="node-join-title">Подключить ноду</h2><p>Используйте одноразовый ключ для ноды с Apollo.NEB.</p></div><button type="button" id="fleet-refresh">Обновить</button></div>
           <p id="fleet-status" class="subline" role="status">Проверяем список нод…</p>
           <form id="fleet-enroll" hidden>
             <label>Название ноды<input id="fleet-label" maxlength="60" required autocomplete="off"></label>
@@ -181,12 +217,18 @@
             <h3>Одноразовое подключение</h3>
             <p id="fleet-invite-expiry" class="subline"></p>
             <dl class="node-invite-values"><dt>ID ноды</dt><dd id="fleet-invite-id"></dd><dt>Код подключения</dt><dd id="fleet-invite-code"></dd></dl>
+            <button type="button" id="fleet-copy-key" class="quiet"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg>Скопировать ключ подключения</button>
             <div class="command" id="fleet-command-copy"><code id="fleet-invite-command"></code><button type="button" id="fleet-copy" class="quiet" aria-label="Копировать команду подключения"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div>
             <p id="fleet-invite-hint" class="subline"></p>
             <button type="button" id="fleet-hide-invite" class="quiet">Скрыть код</button>
           </div>
           <p id="fleet-message" class="form-message" role="status"></p>
         </section>
+        <section class="surface node-card" id="prepared-install" aria-labelledby="prepared-install-title" hidden>
+          <div class="panel-head"><div><h2 id="prepared-install-title">Установить Apollo.NEB</h2><p>Выберите выпуск для подготовленной SSH-ноды.</p></div></div>
+          <ul id="prepared-install-targets" class="setup-rows"></ul>
+        </section>
+        <div id="atlas-node" class="nodes-list" hidden></div>
         <div id="node-list" class="nodes-list"></div>
       </section>
       <section id="events" hidden>
@@ -199,12 +241,28 @@
     </div>
   </main>
   <footer class="frame foot"><span>Apollo.NEB</span><span>Локальная панель · время браузера</span></footer>
+  <dialog id="atlas-event-dialog" aria-labelledby="atlas-event-title">
+    <div class="dialog-head"><h2 id="atlas-event-title">Событие Atlas</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p id="atlas-event-details"></p>
+  </dialog>
+  <dialog id="login" aria-labelledby="unlock-title">
+    <div class="dialog-head"><h2 id="unlock-title">Доступ к управлению</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <form id="login-form">
+      <label>Пароль панели<input id="password" type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>
+      <label id="login-code-row" for="login-code" hidden>Код 2FA или резервный код
+        <input id="login-code" name="code" autocomplete="one-time-code" maxlength="80" spellcheck="false" autocapitalize="none">
+      </label>
+      <button class="primary" type="submit">Разблокировать</button>
+      <p id="login-message" class="form-message" role="status"></p>
+    </form>
+  </dialog>
+
   <dialog id="release-dialog" aria-labelledby="release-title">
     <div class="dialog-head"><h2 id="release-title" tabindex="-1">Обновления</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <dl class="release-facts" aria-label="Версии и система">
-      <div><dt>Установлена</dt><dd id="release-current">—</dd></div>
+      <div><dt id="release-current-label">Установлена</dt><dd id="release-current">—</dd></div>
       <div><dt>Доступна</dt><dd id="release-latest">—</dd></div>
-      <div><dt>Система панели</dt><dd id="release-platform">—</dd></div>
+      <div><dt>Система</dt><dd id="release-platform">—</dd></div>
     </dl>
     <fieldset id="release-channels" class="release-channels" aria-describedby="release-channel-help" disabled>
       <legend>Канал обновлений</legend>
@@ -218,6 +276,10 @@
       <button type="button" class="primary" id="release-check" disabled>Проверить обновления</button>
       <p id="release-status" class="subline" role="status">Загружаем настройки обновлений…</p>
     </div>
+    <label id="release-version-row" class="release-version-row" for="release-version" hidden>
+      <span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg> Версия пакета</span>
+      <select id="release-version" disabled></select>
+    </label>
     <div id="release-candidate" class="release-candidate" hidden>
       <dl class="release-asset">
         <div><dt>Файл релиза</dt><dd id="release-filename"></dd></div>
@@ -227,7 +289,15 @@
       <div class="panel-actions release-links">
         <a id="release-download" class="release-link" target="_blank" rel="noopener noreferrer" hidden>Скачать архив</a>
         <a id="release-link" class="release-link" target="_blank" rel="noopener noreferrer" hidden>Страница релиза</a>
+        <button id="release-apply" class="primary" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg>Установить на ноду</button>
       </div>
+      <section id="release-confirm" class="inner-form" aria-label="Подтверждение установки" hidden>
+        <p id="release-confirm-text"></p>
+        <div class="panel-actions">
+          <button id="release-confirm-submit" class="primary" type="button">Подтвердить установку</button>
+          <button id="release-confirm-cancel" type="button">Отмена</button>
+        </div>
+      </section>
       <details id="release-notes" class="release-detail" hidden>
         <summary>Что изменилось</summary>
         <p id="release-notes-text"></p>
@@ -294,33 +364,6 @@
     </form>
     <p id="totp-message" class="form-message" role="status"></p>
   </dialog>
-  <dialog id="wallets-dialog" aria-labelledby="wallets-title">
-    <div class="dialog-head"><h2 id="wallets-title">Кошельки</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
-    <p>Для выплат используется только публичный адрес. Пароль кошелька отличается от пароля панели; не храните их вместе.</p>
-    <p id="wallets-status" role="status"></p>
-    <div class="panel-actions dialog-actions">
-      <button type="button" id="wallets-refresh">Обновить</button>
-      <button type="button" id="wallets-install" hidden>Загрузить модуль кошелька</button>
-      <button type="button" class="primary" id="wallet-new" hidden>Новый кошелёк</button>
-    </div>
-    <ul id="wallets-list" class="setup-rows"></ul>
-    <form id="wallet-create" class="inner-form" hidden>
-      <h3>Создание кошелька</h3>
-      <label>Название кошелька<input id="wallet-label" required maxlength="48" autocomplete="off"></label>
-      <label>Пароль кошелька<input id="wallet-create-password" type="password" required minlength="14" maxlength="128" autocomplete="new-password"></label>
-      <p class="subline">От 14 символов. Пароль нужен для доступа к файлу кошелька и не восстанавливается панелью.</p>
-      <label>Повторите пароль кошелька<input id="wallet-create-repeat" type="password" required minlength="14" maxlength="128" autocomplete="new-password"></label>
-      <div class="panel-actions"><button type="submit" class="primary">Создать кошелёк</button><button type="button" data-wallet-cancel>Отмена</button></div>
-    </form>
-    <form id="wallet-export" class="inner-form" hidden>
-      <h3>Зашифрованная резервная копия</h3>
-      <p id="wallet-export-target" class="subline"></p>
-      <label>Пароль для резервной копии<input id="wallet-export-password" type="password" required maxlength="128" autocomplete="off"></label>
-      <p class="subline">Введите пароль этого кошелька. Копия останется зашифрованной тем же паролем.</p>
-      <div class="panel-actions"><button type="submit" class="primary">Сохранить .neb</button><button type="button" data-wallet-cancel>Отмена</button></div>
-    </form>
-    <p id="wallets-message" class="form-message" role="status"></p>
-  </dialog>
   <dialog id="discovery-dialog" aria-labelledby="discovery-title">
     <div class="dialog-head"><h2 id="discovery-title">Устройства Linux</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <p>Панель читает устройства и датчики на сервере. Майнер загружается только по вашему запросу.</p>
@@ -340,11 +383,26 @@
     <p id="fleet-revoke-target"></p><p>Это закрывает доступ к панели, но не останавливает майнер на ноде.</p>
     <form id="fleet-revoke-form"><button type="submit" class="stop-button">Отозвать доступ</button></form>
   </dialog>
+  <dialog id="gpu-power-dialog" aria-labelledby="gpu-power-title">
+    <div class="dialog-head"><h2 id="gpu-power-title">Предел мощности GPU</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
+    <p id="gpu-power-device"></p>
+    <form id="gpu-power-form">
+      <label>Новый предел, Вт
+        <input id="gpu-power-watts" type="number" required step="1" aria-describedby="gpu-power-range">
+      </label>
+      <p id="gpu-power-range" class="subline"></p>
+      <button id="gpu-power-send" type="submit" class="primary">Отправить на ноду</button>
+      <p id="gpu-power-message" class="form-message" role="status"></p>
+    </form>
+  </dialog>
   <dialog id="profile-dialog" aria-labelledby="profile-title">
     <div class="dialog-head"><h2 id="profile-title">Профиль пула</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <p>Пул получает только публичный адрес NEB. Не вставляйте приватный ключ или seed-фразу.</p>
     <form id="profile-form">
-      <label>Публичный адрес NEB<input id="wallet" required maxlength="62" placeholder="neb1…" spellcheck="false" autocomplete="off" autocapitalize="none"></label>
+      <label>Адрес выплат NEB
+        <input id="wallet" required maxlength="62" placeholder="neb1…" spellcheck="false" autocomplete="off" autocapitalize="none" aria-describedby="wallet-hint">
+        <span id="wallet-hint" class="subline"></span>
+      </label>
       <label>Имя воркера<input id="worker-name" required maxlength="24" pattern="[A-Za-z0-9_\-]{1,24}" aria-describedby="worker-name-help" spellcheck="false" autocomplete="off" autocapitalize="none"></label>
       <p id="worker-name-help" class="subline">До 24 латинских букв, цифр, дефисов или подчёркиваний.</p>
       <label for="pool">Пул</label><select id="pool" required aria-describedby="pool-help"></select>

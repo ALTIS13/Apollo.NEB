@@ -4,10 +4,13 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import neb_app as app
 import neb_core as core
+from neb_fleet import Fleet
+from neb_release import VERSION
 from test_neb_core import OWNER, SUPPORT
 
 
@@ -48,6 +51,9 @@ class ExampleWorker:
 
     def close(self):
         self.running = False
+
+    def is_idle(self):
+        return not self.running
 
 
 class ServerTests(unittest.TestCase):
@@ -103,6 +109,12 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(req("POST", "/api/network/refresh", {})[0], 401)
                 self.assertEqual(req("POST", "/api/start", {"id": "gpu"}, ref="https://untrusted.example")[0], 403)
                 self.assertEqual(req("POST", "/api/start", {"id": "gpu"})[0], 401)
+                self.assertEqual(req("GET", "/api/runtime")[:2], (200, {"version": VERSION, "idle": True}))
+                code, overview, _ = req("GET", "/api/public/overview")
+                self.assertEqual(code, 200)
+                self.assertEqual(overview["nodes"], {"online": 1, "total": 1})
+                self.assertEqual(overview["workers"], observation["workers"])
+                self.assertNotIn(OWNER, json.dumps(overview))
                 status, _, cookie = req("POST", "/api/login", {"password": "fixture password only"})
                 self.assertEqual(status, 200)
                 self.assertIn("HttpOnly; SameSite=Strict", cookie)
@@ -110,6 +122,13 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(req("GET", "/api/devfee", cookie=cookie)[0], 404)
                 self.assertEqual(req("POST", "/api/devfee", {"paused": True}, cookie=cookie)[0], 404)
                 self.assertEqual(req("GET", "/policy", cookie=cookie)[0], 404)
+                code, operator, _ = req("GET", "/api/status", cookie=cookie)
+                self.assertEqual(code, 200)
+                self.assertEqual(operator["profile"], {"worker": "test", "pool": "suprnova-eu", "wallet_configured": True})
+                self.assertEqual(operator["overview"], overview)
+                self.assertNotIn(OWNER, json.dumps(operator))
+                self.assertEqual(req("GET", "/api/wallets", cookie=cookie)[0], 404)
+                self.assertEqual(req("POST", "/api/profile", {"worker": "renamed", "pool": "suprnova-eu"}, cookie=cookie)[0], 200)
                 self.assertEqual(req("GET", "/api/network", cookie=cookie)[1]["state"], "unchecked")
                 self.assertEqual(req("GET", "/api/logs?worker=other", cookie=cookie)[0], 400)
                 code, logs, _ = req("GET", "/api/logs?worker=gpu", cookie=cookie)
@@ -118,6 +137,7 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(req("POST", "/api/start", {"id":"different"}, cookie=cookie)[0], 409)
                 self.assertEqual(req("POST", "/api/start", {"id":"gpu", "wallet": SUPPORT}, cookie=cookie)[0], 200)
                 self.assertEqual(self.runtime.calls, [("start", "gpu", OWNER)])
+                self.assertEqual(req("GET", "/api/runtime")[1]["idle"], False)
                 self.assertEqual(req("GET", "/api/public/status")[1]["hashrate_hs"], 1500000)
                 self.assertEqual(req("POST", "/api/profile", {"wallet": SUPPORT, "worker":"test", "pool":"suprnova-eu"}, cookie=cookie)[0], 409)
                 self.assertEqual(req("POST", "/api/logout", {}, cookie=cookie)[0], 200)
@@ -126,6 +146,35 @@ class ServerTests(unittest.TestCase):
                 conn.close()
                 server.shutdown()
                 thread.join()
+
+    def test_guest_link_and_dashboard_serve_one_document(self):
+        with app.Server(("127.0.0.1", 0), self.service, self.auth, app.HERE / "web", None) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            try:
+                documents = []
+                for route in ("/", "/view"):
+                    conn.request("GET", route)
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    documents.append(response.read())
+                self.assertTrue(documents[0] == documents[1], "The shared dashboard should serve both entry points.")
+            finally:
+                conn.close()
+                server.shutdown()
+                thread.join()
+
+    def test_node_update_reserves_idle_runtime_until_release(self):
+        with self.service.lock:
+            self.assertTrue(self.service.reserve_upgrade())
+            self.assertTrue(self.service.runtime_status()["idle"])
+            with self.assertRaisesRegex(ValueError, "обновлен"):
+                self.service.change("start", {"id": "gpu"})
+        self.assertEqual(self.runtime.calls, [])
+        self.service.finish_upgrade()
+        self.service.change("start", {"id": "gpu"})
+        self.assertFalse(self.service.reserve_upgrade())
 
     def test_controller_disables_local_mutations_even_with_a_worker_row(self):
         service = app.Service(self.conf, self.base / "state", self.runtime, core.DEFAULT_POOLS, None,
@@ -198,20 +247,100 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.runtime.calls, [("start", "gpu", OWNER)])
         self.assertEqual(self.service.status()["support"]["state"], "unavailable")
 
-    def test_network_forecast_requires_recent_measured_rate_and_fresh_network_data(self):
+    def test_network_forecast_uses_fresh_fleet_rates_and_network_difficulty(self):
         now = self.service.last
+        registry = self.service.fleet = Fleet(self.base / "fleet.sqlite")
+        for label, key, stamp, rate in (("Running", "a" * 43, now, 2500000),
+                                         ("Stale", "b" * 43, now - 60, 10000000)):
+            invite = registry.enroll(label, now=stamp)
+            registry.pair(invite["id"], invite["code"], key, now=stamp)
+            registry.poll(invite["id"], key, [{"id": "gpu", "state": "running", "rate_hs": rate}], [], now=stamp)
         network = {"state": "fresh", "data": {"difficulty": 86400, "reward_neb": 19}}
         with patch.object(self.service.network, "status", return_value=network):
-            self.assertIsNone(self.service.network_status()["estimate_neb_day"])
+            self.assertEqual(self.service.network_status()["estimate_neb_day"], 2500000 * 19)
             self.runtime.running = True
-            rows = self.runtime.snapshot(core.LIMITS)
-            for at in range(now - 15 * 90, now, 15):
-                self.service.archive.tick(at, rows, [])
-            # The initial stopped sample contributes zero to the 90 running samples.
-            expected = (1500000 * 90 / 91) * 19
-            self.assertAlmostEqual(self.service.network_status()["estimate_neb_day"], expected)
+            self.service.poll()
+            self.assertEqual(self.service.network_status()["farm_rate_hs"], 4000000)
+            self.assertEqual(self.service.network_status()["estimate_neb_day"], 4000000 * 19)
             network["state"] = "stale"
             self.assertIsNone(self.service.network_status()["estimate_neb_day"])
+
+    def test_atlas_is_only_read_through_operator_status_and_history(self):
+        stamp = self.service.last
+        snapshot = {"status": "online", "time": stamp, "rate_hs": 6000000, "watts": 200,
+                    "temperatures": {"edge": 65, "hot": None, "hbm": None}, "shares": {"accepted": 2, "rejected": 0},
+                    "gpu_counts": {"active": 1, "total": 4}, "gpus": []}
+        archive = {"range": "30d", "from": stamp - 3600, "to": stamp, "step": 60,
+                   "series": [{"t": stamp - 120, "rate": 6}], "incidents": []}
+        self.service.atlas = SimpleNamespace(snapshot=lambda: snapshot, history=lambda selected: archive if selected == "30d" else None)
+        with app.Server(("127.0.0.1", 0), self.service, self.auth, app.HERE / "web", None) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            try:
+                def get(path, token=None):
+                    connection.request("GET", path, headers={"Cookie": f"neb_sid={token}"} if token else {})
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+
+                history = "/api/history?range=30d&source=atlas"
+                self.assertEqual(get(history)[0], 401)
+                self.assertEqual(get("/api/public/overview")[1]["hashrate_hs"], 0)
+                token = self.auth.enter("fixture password only", "")
+                status = get("/api/status", token)[1]
+                self.assertEqual(status["overview"]["hashrate_hs"], 6000000)
+                self.assertEqual(status["atlas"]["gpu_counts"], {"active": 1, "total": 4})
+                self.assertEqual(get(history, token), (200, {**archive, "source": "atlas"}))
+            finally:
+                connection.close()
+                server.shutdown()
+                thread.join(timeout=3)
+
+    def test_power_routes_require_https_operator_and_node_key(self):
+        from test_neb_fleet import POWER_GPU, WINDOWS_RELEASE
+
+        registry = self.service.fleet = Fleet(self.base / "fleet.sqlite")
+        invite = registry.enroll("NVIDIA fixture")
+        node = invite["id"]
+        key = "e" * 43
+        registry.pair(node, invite["code"], key)
+        registry.poll(node, key, [], [], release=WINDOWS_RELEASE,
+                      hardware={"devices": [POWER_GPU], "power_control": True})
+        origin = "https://power.fixture.invalid"
+        with app.Server(("127.0.0.1", 0), self.service, self.auth, app.HERE / "web", origin) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            try:
+                def post(path, body, *, host="power.fixture.invalid", ref=origin, cookie=None):
+                    headers = {"Host": host, "Content-Type": "application/json"}
+                    if ref is not None:
+                        headers["Origin"] = ref
+                    if cookie:
+                        headers["Cookie"] = cookie
+                    connection.request("POST", path, json.dumps(body), headers)
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+
+                queue, pull = "/api/fleet/power", "/api/node/power"
+                setting = {"node": node, "gpu": POWER_GPU["id"], "watts": 225}
+                token = "neb_sid=" + self.auth.enter("fixture password only", "")
+                self.assertEqual(post(queue, setting)[0], 401)
+                self.assertEqual(post(queue, setting, cookie=token, ref="https://another.invalid")[0], 403)
+                loopback = f"127.0.0.1:{server.server_port}"
+                self.assertEqual(post(queue, setting, host=loopback, ref="http://" + loopback, cookie=token)[0], 403)
+                self.assertEqual(post(queue, setting, cookie=token)[0], 202)
+                body = {"id": node, "key": key, "receipt": None}
+                self.assertEqual(post(pull, body, cookie=token, ref=None)[0], 403)
+                self.assertEqual(post(pull, {**body, "key": "x" * 43}, ref=None)[0], 401)
+                status, result = post(pull, body, ref=None)
+                self.assertEqual(status, 200)
+                self.assertEqual(result["job"]["watts"], 225)
+                self.assertEqual(post(pull, body, ref=None), (200, {"job": None}))
+            finally:
+                connection.close()
+                server.shutdown()
+                thread.join(timeout=3)
 
     def test_expired_support_returns_to_operator_before_credit_checkpoint(self):
         self.service.clock = core.SupportClock(core.support_config(

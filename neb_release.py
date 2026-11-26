@@ -22,7 +22,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from neb_core import read, store
 from neb_setup import Asset, download, file_digest
 
-VERSION = "0.9.0"
+VERSION = "0.9.2-rc.7"
 MINIMUM_RELEASE = "0.7.1-rc.1"
 REPO = "ALTIS13/Apollo.NEB"
 RELEASES = f"https://github.com/{REPO}/releases"
@@ -32,10 +32,11 @@ METADATA_TIMEOUT = 3
 MAX_RAW_CATALOG = 256 * 1024
 _metadata_slots = {url: threading.BoundedSemaphore() for url in (REMOTE, RAW_CATALOG)}
 MAX_DOWNLOAD = 20 * 1024**2
+MAX_DESKTOP_DOWNLOAD = 160 * 1024**2
 MAX_METADATA = 2 * 1024**2
 CHANNEL_FILE = "release-channel.json"
 CHANNELS = ("stable", "testing")
-SUFFIXES = {"linux": "linux.tar.gz", "windows": "windows-x64.zip"}
+SUFFIXES = {"linux": "linux.tar.gz", "windows": "windows-x64.zip", "windows-desktop": "windows-x64.zip"}
 LINUX_KERNELS = ("6.6", "6.12")
 TAG = re.compile(r"v([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})(?:-rc\.([0-9]{1,4}))?")
 STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -100,7 +101,7 @@ def read_channel(config):
     raise ValueError("Настройка канала повреждена. Выберите канал заново.")
 
 
-def checked_asset(assets, tag, name):
+def checked_asset(assets, tag, name, *, max_size=MAX_DOWNLOAD):
     matches = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == name]
     if len(matches) != 1:
         return None
@@ -109,12 +110,12 @@ def checked_asset(assets, tag, name):
     url = f"{RELEASES}/download/{tag}/{name}"
     if (item.get("state") == "uploaded" and item.get("browser_download_url") == url
             and isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
-            and type(size) is int and 1 <= size <= MAX_DOWNLOAD):
+            and type(size) is int and 1 <= size <= max_size):
         return Asset(url, digest[7:], size)
     return None
 
 
-def candidate(release, channel, suffixes):
+def candidate(release, channel, suffixes, *, desktop=False):
     if not isinstance(release, dict) or release.get("draft") is not False:
         return None
     tag = release.get("tag_name")
@@ -139,8 +140,8 @@ def candidate(release, channel, suffixes):
     if not isinstance(assets, list):
         return None
     for suffix in suffixes:
-        name = f"apollo-neb-{base}-{suffix}"
-        asset = checked_asset(assets, tag, name)
+        name = f"apollo-neb-desktop-{tag[1:]}-{suffix}" if desktop else f"apollo-neb-{base}-{suffix}"
+        asset = checked_asset(assets, tag, name, max_size=MAX_DESKTOP_DOWNLOAD if desktop else MAX_DOWNLOAD)
         if asset:
             body = release.get("body")
             notes = "".join(c for c in body[:6000] if c in "\n\t" or c.isprintable()).strip() if isinstance(body, str) else ""
@@ -148,18 +149,31 @@ def candidate(release, channel, suffixes):
     return None
 
 
-def select(entries, *, channel="stable", platform="linux", kernel=None, tag=None):
+def _compatible(entries, *, channel, platform, kernel, tag=None):
     channel_value(channel)
     suffix = SUFFIXES.get(platform)
     if not suffix or not isinstance(entries, list):
-        return None
+        return
     suffixes = (f"linux-x64-kernel-{kernel}.tar.gz", suffix) if platform == "linux" and kernel in LINUX_KERNELS else (suffix,)
-    candidates = []
     for release in entries:
-        record = candidate(release, channel, suffixes)
+        record = candidate(release, channel, suffixes, desktop=platform == "windows-desktop")
         if record and (tag is None or record.tag == tag):
-            candidates.append(record)
-    return max(candidates, key=lambda item: item.order, default=None)
+            yield record
+
+
+def select(entries, *, channel="stable", platform="linux", kernel=None, tag=None):
+    compatible = _compatible(entries, channel=channel, platform=platform, kernel=kernel, tag=tag)
+    return max(compatible, key=lambda item: item.order, default=None)
+
+
+def _release_fields(release):
+    return {
+        "release_url": release.release_url,
+        "published_at": release.published_at,
+        "notes": release.notes,
+        "asset": {"name": release.name, "url": release.asset.url,
+                  "sha256": release.asset.digest, "size": release.asset.size},
+    }
 
 
 class NoMetadataRedirect(HTTPRedirectHandler):
@@ -247,6 +261,42 @@ class Releases:
             store(config / CHANNEL_FILE, choice)
         return choice
 
+    def _refresh_catalog(self):
+        if self.catalog is None or time.monotonic() - self.checked >= 120:
+            try:
+                self.catalog, self.message = records(), None
+            except ValueError as error:
+                self.catalog, self.message = [], str(error)
+            self.checked = time.monotonic()
+
+    def versions(self, config=None, *, current=None, channel=None, platform=None, kernel=None):
+        """Return strictly newer releases for a target, highest version first.
+
+        An explicit platform overrides host defaults. For a Linux target, omit
+        kernel to select generic archives. Unavailable catalog metadata raises
+        ValueError, while an available catalog with no compatible releases gives [].
+        """
+        order = version(VERSION if current is None else current)
+        if order is None:
+            raise ValueError("Укажите корректную текущую версию Apollo.NEB.")
+        if platform is None:
+            platform = self.platform
+            if kernel is None:
+                kernel = self.kernel
+        with self.lock:
+            channel = read_channel(config) if channel is None else channel_value(channel)
+            if not isinstance(platform, str) or platform not in SUFFIXES:
+                return []
+            self._refresh_catalog()
+            if self.message is not None:
+                raise ValueError(self.message)
+            newer = {}
+            for release in _compatible(self.catalog, channel=channel, platform=platform, kernel=kernel):
+                if release.order > order:
+                    newer.setdefault(release.tag, release)
+            ordered = sorted(newer.values(), key=lambda release: release.order, reverse=True)
+            return [{"tag": release.tag, **_release_fields(release)} for release in ordered]
+
     def status(self, config=None, *, check=True):
         with self.lock:
             channel = read_channel(config)
@@ -257,23 +307,14 @@ class Releases:
             if self.platform not in SUFFIXES:
                 row.update(state="unavailable", message="Для этой платформы нет пакета Apollo.NEB.")
                 return row
-            now = time.monotonic()
-            if self.catalog is None or now - self.checked >= 120:
-                try:
-                    self.catalog, self.message = records(), None
-                except ValueError as error:
-                    self.catalog, self.message = [], str(error)
-                self.checked = time.monotonic()
+            self._refresh_catalog()
             latest = select(self.catalog, channel=channel, platform=self.platform, kernel=self.kernel)
             if latest is None:
                 row.update(state="unavailable", message=self.message or "В этом канале нет проверяемого выпуска для платформы.")
             elif latest.order <= version(VERSION):
                 row.update(state="current", latest=latest.tag)
             else:
-                row.update(state="available", latest=latest.tag, release_url=latest.release_url,
-                           published_at=latest.published_at, notes=latest.notes,
-                           asset={"name": latest.name, "url": latest.asset.url,
-                                  "sha256": latest.asset.digest, "size": latest.asset.size})
+                row.update(state="available", latest=latest.tag, **_release_fields(latest))
             return row
 
 

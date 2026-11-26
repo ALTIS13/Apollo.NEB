@@ -15,15 +15,17 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
     "neb.py", "neb_app.py", "neb_core.py", "neb_devfee.py", "neb_fleet.py", "neb_history.py",
-    "neb_network.py", "neb_release.py", "neb_runtime.py", "neb_setup.py", "neb_wallet.py",
+    "neb_network.py", "neb_overview.py", "neb_release.py", "neb_runtime.py", "neb_setup.py",
+    "neb_remote_install.py", "neb_remote_bootstrap.py", "neb_atlas.py",
 )
 WEB = tuple(f"web/{file}" for file in (
     "brand.svg", "history-chart.js", "index.html", "live-metrics.js", "qr.js",
-    "recovery-codes.js", "select-menu.js", "ui.css", "ui.js", "view.html", "view.js",
+    "recovery-codes.js", "select-menu.js", "ui.css", "ui.js", "view.js",
 ))
 DOCS = ("README.md", "docs/onboarding-and-distribution.md", "docs/release-checks.md")
 LINUX = (
-    "apollo-neb", "apollo-neb.service", "install.sh", "neb_install_check.py",
+    "apollo-neb", "apollo-neb.service", "install.sh", "neb_install_check.py", "neb_platform.py",
+    "neb_node_update.py", "neb_update_apply.py",
     "examples/custom.json", "examples/suprminer-amd.json", "examples/suprminer-nvidia.json",
 )
 WINDOWS = ("Apollo.NEB.cmd", "neb_windows.py")
@@ -110,6 +112,26 @@ def build(target, revision):
     return name, (zip_payload(root, entries) if windows else tar_payload(root, entries))
 
 
+def write_archive(directory, name, payload):
+    directory.mkdir(parents=True, exist_ok=True)
+    archive = directory / name
+    checksum = archive.with_name(name + ".sha256")
+    digest = hashlib.sha256(payload).hexdigest()
+    written = []
+    try:
+        with archive.open("xb") as file:
+            written.append(archive)
+            file.write(payload)
+        with checksum.open("x", encoding="ascii", newline="\n") as file:
+            written.append(checksum)
+            file.write(f"{digest}  {name}\n")
+    except OSError:
+        for path in written:
+            path.unlink()
+        raise
+    return digest, archive
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=TARGETS, required=True)
@@ -120,22 +142,7 @@ def main():
                                         args.commit + "^{commit}"], cwd=ROOT, text=True).strip()
                 if args.commit else None)
     name, payload = build(args.target, revision)
-    args.output.mkdir(parents=True, exist_ok=True)
-    archive = args.output / name
-    checksum = archive.with_name(name + ".sha256")
-    digest = hashlib.sha256(payload).hexdigest()
-    written = []
-    try:
-        with archive.open("xb") as output:
-            written.append(archive)
-            output.write(payload)
-        with checksum.open("x", encoding="ascii", newline="\n") as output:
-            written.append(checksum)
-            output.write(f"{digest}  {name}\n")
-    except OSError:
-        for path in written:
-            path.unlink()
-        raise
+    digest, archive = write_archive(args.output, name, payload)
     print(f"{digest}  {archive}")
 
 

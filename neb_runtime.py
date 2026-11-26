@@ -773,6 +773,10 @@ class Manager:
             self._stop(worker_id, "stop", "Stopped by request.", "stopped")
             self._expired.discard(worker_id)
 
+    def is_idle(self):
+        with self._lock:
+            return not self._live
+
     def snapshot(self, limits: dict) -> list[dict]:
         with self._lock:
             self._limits = _limits(limits)

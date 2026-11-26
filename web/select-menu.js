@@ -246,7 +246,7 @@
     const state = menus.get(select);
     if (state) sync(state);
   };
-  document.querySelectorAll("select:is(#period, #metric, #event-filter, #pool):not([multiple])").forEach(enhance);
+  document.querySelectorAll("select:is(#history-source, #period, #metric, #event-filter, #pool, #release-version):not([multiple])").forEach(enhance);
   document.addEventListener("pointerdown", event => {
     if (opened && !opened.wrap.contains(event.target) && !opened.list.contains(event.target)) close(opened);
   }, true);
