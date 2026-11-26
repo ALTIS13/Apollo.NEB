@@ -86,6 +86,25 @@ class FleetTests(unittest.TestCase):
         self.fleet.revoke(node, now=self.at + 2)
         self.assertEqual(self.fleet.observations(now=self.at + 2)["nodes"], [])
 
+    def test_windows_power_profile_keeps_the_reported_factory_limit(self):
+        node = self.node()["id"]
+        old = POWER_GPU["power_limit"]
+        for invalid in (174, 301, True, None, float("nan")):
+            with self.subTest(factory=invalid), self.assertRaises(ValueError):
+                self.fleet.poll(node, self.key, [], [], now=self.at, release=WINDOWS_RELEASE,
+                               hardware={"devices": [{**POWER_GPU, "power_limit": {**old, "default_watts": invalid}}]})
+        limits = {**old, "default_watts": 250}
+        device = {**POWER_GPU, "power_limit": limits}
+        self.fleet.poll(node, self.key, [], [], now=self.at, release=WINDOWS_RELEASE,
+                       hardware={"devices": [device], "power_control": True})
+        self.assertEqual(self.fleet.list(now=self.at)["nodes"][0]["hardware"]["devices"][0]["power_limit"], limits)
+        with self.assertRaises(ValueError):
+            self.fleet.queue_power(node, device["id"], 150, now=self.at)
+        self.assertEqual(self.fleet.queue_power(node, device["id"], 200, now=self.at)["watts"], 200)
+        self.fleet.poll(node, self.key, [], [], now=self.at + 1, release=WINDOWS_RELEASE,
+                       hardware={"devices": [POWER_GPU], "power_control": True})
+        self.assertEqual(self.fleet.list(now=self.at + 1)["nodes"][0]["hardware"]["devices"][0]["power_limit"], old)
+
     def test_power_requires_available_opted_gpu_single_claim_and_matching_readback(self):
         node = self.node()["id"]
         hardware = {"devices": [POWER_GPU]}

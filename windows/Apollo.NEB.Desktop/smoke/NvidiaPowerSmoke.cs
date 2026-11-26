@@ -12,21 +12,28 @@ internal static class NvidiaPowerSmoke
     internal static async Task RunAsync(CancellationToken token)
     {
         var samples = NvidiaTelemetry.ParsePowerLimits("""
-            0000:01:00.0, 250.00, 175.00, 300.00
+            0000:01:00.0, 250.00, 175.00, 300.00, 250.00
             00000000:02:00.0, [N/A], [N/A], [N/A]
             00000000:03:00.0, 260, 275, 290
             00000000:04:00.0, Infinity, 1, 3000
             00000000:05:00.0, 250, 1, 3001
             00000000:06:00.0, 250, 200, 300
             0000:06:00.0, 255, 200, 300
+            00000000:07:00.0, 222, 175, 300
+            00000000:08:00.0, 223, 175, 300, 350
             """);
-        Need(samples.Count == 1 && samples[Gpu] == new NvidiaPowerLimit(250, 175, 300),
-            "A query without supported bounds must not invent or invalidate NVIDIA telemetry.");
+        Need(samples.Count == 3 && samples.TryGetValue(Gpu, out var first) &&
+            JsonSerializer.SerializeToElement(first).GetProperty("default_watts").GetDouble() == 250,
+            "A known factory limit is optional NVIDIA telemetry alongside the three valid active limits.");
+        foreach (string id in new[] { "00000000:07:00.0", "00000000:08:00.0" })
+            Need(samples[id].IsValid && !JsonSerializer.SerializeToElement(samples[id]).TryGetProperty("default_watts", out _),
+                "Older NVIDIA output or an inconsistent factory limit preserves the reported range.");
         var devices = NvidiaTelemetry.Parse("Fixture GPU, 0000:01:00.0, 55, 10, N/A, 8192, 47")
             .Select(gpu => gpu with { PowerLimit = samples[Gpu] }).ToArray();
         var noRights = new NvidiaPowerAuthority(elevated: false);
         noRights.Allow(true);
         Need(!noRights.Granted, "Opt-in never confers Windows administrator rights.");
+        await TestLocalAsync(token);
         var authority = new NvidiaPowerAuthority(elevated: true);
         var panel = new Panel();
         var adapter = new Adapter(panel.Calls);
@@ -39,6 +46,7 @@ internal static class NvidiaPowerSmoke
             {
                 var origin = new Uri("https://power.invalid/");
                 await link.PairAsync(origin, Node + "." + Invite, devices, token);
+                Need(panel.ReportedDefault, "Forward the verified factory limit to a capable panel.");
                 await link.ReportAsync(devices, false, token, control);
                 Need(!panel.Advertised && !panel.Calls.Contains("job") && adapter.Writes == 0,
                     "Power collection and sending cannot arm a fresh session.");
@@ -144,6 +152,17 @@ internal static class NvidiaPowerSmoke
                     "A new opt-in cannot revive a claim from the previous permission.");
                 panel.OnClaim = null;
 
+                panel.Job = null;
+                panel.DefaultUnsupported = true;
+                panel.Calls.Clear();
+                await link.ReportAsync(devices, false, token, control);
+                Need(panel.Calls.SequenceEqual(["poll", "poll", "job"]) && panel.Advertised && !panel.ReportedDefault &&
+                    adapter.Writes == 3, "A server without the factory field still receives remote power capability.");
+                panel.Calls.Clear();
+                await link.ReportAsync(devices, false, token, control);
+                Need(panel.Calls.SequenceEqual(["poll", "job"]) && panel.Advertised && !panel.ReportedDefault,
+                    "Remember the accepted wire schema rather than retrying a rejected field every heartbeat.");
+
                 panel.ExtendedUnsupported = true;
                 panel.Calls.Clear();
                 await link.ReportAsync(devices, false, token, control);
@@ -160,7 +179,78 @@ internal static class NvidiaPowerSmoke
                 Directory.Delete(directory);
             }
         }
-        Console.WriteLine("PASS: NVIDIA optional ranges, exact power wire, permission/claim boundaries, readback, no replay, and legacy telemetry.");
+        Console.WriteLine("PASS: NVIDIA factory limits, gated local/remote writes, checked readback, no replay, and legacy telemetry.");
+    }
+
+    private static async Task TestLocalAsync(CancellationToken token)
+    {
+        var calls = new List<string>();
+        var adapter = new Adapter(calls);
+        var unprivileged = new NvidiaPowerControl(new(elevated: false), adapter);
+        Need(!unprivileged.CanApplyLocally &&
+            (await unprivileged.ApplyLocalAsync(Gpu, 224, token)).Phase == "refused" && calls.Count == 0,
+            "A local write requires an already-elevated process.");
+
+        var authority = new NvidiaPowerAuthority(elevated: true);
+        var control = new NvidiaPowerControl(authority, adapter);
+        var local = await control.ApplyLocalAsync(Gpu, 225, token);
+        Need(control.CanApplyLocally && !authority.Granted && local is { Phase: "applied", ObservedWatts: 225 } &&
+            calls.SequenceEqual(["bounds", "write", "bounds"]) && control.LastAttempt is null,
+            "Explicit local writes work without a Fleet grant and require fresh bounds and readback.");
+        Need((await control.ApplyLocalAsync(Gpu, 301, token)).Phase == "refused" &&
+            (await control.ApplyLocalAsync("0000:01:00.0", 226, token)).Phase == "refused" && adapter.Writes == 1,
+            "Local limits use exact canonical PCI and the live range.");
+        adapter.SetResult = NvidiaPowerWrite.Unknown;
+        Need((await control.ApplyLocalAsync(Gpu, 226, token)) is { Phase: "unknown", ObservedWatts: 226 },
+            "An unconfirmed local setter stays unknown despite matching readback.");
+        adapter.SetResult = NvidiaPowerWrite.Completed;
+        authority.Allow(true);
+        long consent = authority.ConsentVersion!.Value;
+        var advertised = new HashSet<string> { Gpu };
+
+        var writing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        adapter.OnWriteStarted = stop =>
+        {
+            writing.SetResult();
+            return release.Task.WaitAsync(stop);
+        };
+        Task<NvidiaPowerAttempt> localWrite = control.ApplyLocalAsync(Gpu, 227, token);
+        try
+        {
+            await writing.Task.WaitAsync(token);
+            Need(!authority.WriteStarted && (await control.ApplyLocalAsync(Gpu, 228, token)).Phase == "busy",
+                "A local write reserves the controller and never presents a remote command as started.");
+            await control.RunAsync(advertised, consent,
+                (_, _) => throw new InvalidOperationException("Remote polling raced the local write."), token);
+        }
+        finally { release.TrySetResult(); }
+        Need((await localWrite).Phase == "applied" && control.LastAttempt is null,
+            "Finishing a local write leaves the remote outcome untouched.");
+
+        writing = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task remoteWrite = control.RunAsync(advertised, consent, (receipt, _) =>
+        {
+            string json = receipt is null ? JsonSerializer.Serialize(new { job = Job(100, 228) })
+                : JsonSerializer.SerializeToElement(receipt).GetProperty("phase").GetString() == "claim"
+                    ? JsonSerializer.Serialize(new { ok = true, lease_expires = NvidiaPowerControl.Now() + 15 })
+                    : """{"ok":true}""";
+            return Task.FromResult(JsonDocument.Parse(json));
+        }, token);
+        try
+        {
+            await writing.Task.WaitAsync(token);
+            Need(authority.WriteStarted && (await control.ApplyLocalAsync(Gpu, 229, token)).Phase == "busy",
+                "A remote write reserves the same controller until verification and receipt.");
+        }
+        finally { release.TrySetResult(); }
+        await remoteWrite;
+        adapter.OnWriteStarted = null;
+        var remote = control.LastAttempt;
+        Need(remote is { Phase: "applied", ObservedWatts: 228, Confirmed: true } && !authority.WriteStarted &&
+            (await control.ApplyLocalAsync(Gpu, 229, token)).Phase == "applied" && control.LastAttempt == remote,
+            "A later local write preserves the previously acknowledged Fleet result.");
     }
 
     private static object Job(int id, int watts, string gpu = Gpu, long? expires = null) => new
@@ -178,6 +268,7 @@ internal static class NvidiaPowerSmoke
         internal NvidiaPowerLimit Bounds { get; set; } = new(250, 175, 300);
         internal NvidiaPowerWrite SetResult { get; set; } = NvidiaPowerWrite.Completed;
         internal int Writes { get; private set; }
+        internal Func<CancellationToken, Task>? OnWriteStarted { get; set; }
         public bool Available => true;
         public Task<NvidiaPowerLimit?> ReadAsync(string pci, CancellationToken token)
         {
@@ -185,15 +276,16 @@ internal static class NvidiaPowerSmoke
             calls.Add("bounds");
             return Task.FromResult<NvidiaPowerLimit?>(Bounds);
         }
-        public Task<NvidiaPowerWrite> WriteAsync(string pci, int watts, NvidiaPowerLease lease, NvidiaPowerAuthority authority,
+        public async Task<NvidiaPowerWrite> WriteAsync(string pci, int watts, Func<Func<bool>, bool> permitStart,
             CancellationToken token)
         {
-            Need(pci == Gpu && watts is >= 175 and <= 300 && authority.TryBegin(lease, () => true),
+            Need(pci == Gpu && watts is >= 175 and <= 300 && permitStart(() => true),
                 "Only the exact validated PCI and watts reach the fake setter.");
             calls.Add("write");
             Writes++;
             Bounds = Bounds with { Current = watts };
-            return Task.FromResult(SetResult);
+            if (OnWriteStarted is { } pause) await pause(token);
+            return SetResult;
         }
     }
 
@@ -208,6 +300,8 @@ internal static class NvidiaPowerSmoke
         internal double? Observed { get; private set; }
         internal bool LoseTerminal { get; set; }
         internal bool ExtendedUnsupported { get; set; }
+        internal bool DefaultUnsupported { get; set; }
+        internal bool ReportedDefault { get; private set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
         {
@@ -226,10 +320,16 @@ internal static class NvidiaPowerSmoke
                 Need(json.GetProperty("workers").GetArrayLength() == 0, "GPU power remains independent of mining.");
                 var gpu = hardware.GetProperty("devices")[0];
                 bool hasLimits = gpu.TryGetProperty("power_limit", out var limits);
+                ReportedDefault = false;
                 if (hasLimits)
-                    Need(limits.EnumerateObject().Count() == 3 && limits.GetProperty("current").GetDouble() == 250 &&
-                        limits.GetProperty("min").GetDouble() == 175 && limits.GetProperty("max").GetDouble() == 300,
-                        "Report the known optional range in exact wire fields.");
+                {
+                    ReportedDefault = limits.TryGetProperty("default_watts", out var factory);
+                    Need(limits.EnumerateObject().Count() == (ReportedDefault ? 4 : 3) &&
+                        limits.GetProperty("current").GetDouble() == 250 &&
+                        limits.GetProperty("min").GetDouble() == 175 && limits.GetProperty("max").GetDouble() == 300 &&
+                        (!ReportedDefault || factory.GetDouble() == 250), "Report the valid optional range in exact wire fields.");
+                }
+                if (DefaultUnsupported && ReportedDefault) return Reply("{}", HttpStatusCode.BadRequest);
                 if (ExtendedUnsupported && (Advertised || hasLimits))
                     return Reply("{}", HttpStatusCode.Conflict);
                 return Reply("""{"commands":[]}""");

@@ -20,6 +20,7 @@ internal static class NvidiaTelemetry
     private const int MaxErrorBytes = 4 * 1024;
     private const string Query = "--query-gpu=name,pci.bus_id,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw";
     private const string PowerQuery = "--query-gpu=pci.bus_id,power.limit,power.min_limit,power.max_limit";
+    private const string PowerQueryWithDefault = PowerQuery + ",power.default_limit";
     private const string CsvFormat = "--format=csv,noheader,nounits";
     private static readonly Regex PciAddress = new(@"\A[0-9a-f]{4}(?:[0-9a-f]{4})?:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\z",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -47,8 +48,10 @@ internal static class NvidiaTelemetry
     private static async Task<Dictionary<string, NvidiaPowerLimit>> QueryPowerLimitsAsync(
         string executable, string? pci, CancellationToken token)
     {
-        string[] args = pci is null ? [PowerQuery, CsvFormat] : ["-i", pci, PowerQuery, CsvFormat];
+        string[] args = pci is null ? [PowerQueryWithDefault, CsvFormat] : ["-i", pci, PowerQuery, CsvFormat];
         var result = await RunAsync(executable, args, token).ConfigureAwait(false);
+        if (pci is null && result.ExitCode != 0)
+            result = await RunAsync(executable, [PowerQuery, CsvFormat], token).ConfigureAwait(false);
         return result.ExitCode == 0 ? ParsePowerLimits(result.Output) : new();
     }
 
@@ -61,16 +64,19 @@ internal static class NvidiaTelemetry
         while ((row = reader.ReadLine()) is not null)
         {
             var fields = row.Split(',', StringSplitOptions.TrimEntries);
-            if (fields.Length != 4 || !PciAddress.IsMatch(fields[0])) continue;
+            if (fields.Length is not (4 or 5) || !PciAddress.IsMatch(fields[0])) continue;
             string id = CanonicalAddress(fields[0]);
             if (!seen.Add(id))
             {
                 found.Remove(id);
                 continue;
             }
-            if (PowerNumber(fields[1], out var current) && PowerNumber(fields[2], out var min)
-                && PowerNumber(fields[3], out var max) && new NvidiaPowerLimit(current, min, max) is { IsValid: true } limits)
-                found.Add(id, limits);
+            if (!PowerNumber(fields[1], out var current) || !PowerNumber(fields[2], out var min)
+                || !PowerNumber(fields[3], out var max) || new NvidiaPowerLimit(current, min, max) is not { IsValid: true } limits)
+                continue;
+            if (fields.Length == 5 && PowerNumber(fields[4], out var factory) && factory >= min && factory <= max)
+                limits = limits with { DefaultWatts = factory };
+            found.Add(id, limits);
         }
         return found;
     }
@@ -81,7 +87,7 @@ internal static class NvidiaTelemetry
     internal static string CanonicalAddress(string busId) => busId.PadLeft(16, '0').ToLowerInvariant();
 
     private static async Task<ToolReply> RunAsync(string executable, IReadOnlyList<string> args,
-        CancellationToken token, Func<Func<bool>, bool>? permittedStart = null)
+        CancellationToken token, Func<Func<bool>, bool>? permittedStart = null, Action? onUnsettledWrite = null)
     {
         token.ThrowIfCancellationRequested();
         var settings = new ProcessStartInfo(executable)
@@ -116,13 +122,15 @@ internal static class NvidiaTelemetry
         }
         finally
         {
-            if (started) EndOwnQuery(process);
+            if (started && !EndOwnProcess(process, waitForExit: onUnsettledWrite is not null))
+                onUnsettledWrite?.Invoke();
         }
     }
 
     internal sealed class PowerAdapter : INvidiaPowerAdapter
     {
-        public bool Available => FindTool(requireSignature: true) is not null;
+        private volatile bool _unsettledWrite;
+        public bool Available => !_unsettledWrite && FindTool(requireSignature: true) is not null;
 
         public async Task<NvidiaPowerLimit?> ReadAsync(string pci, CancellationToken token)
         {
@@ -131,15 +139,14 @@ internal static class NvidiaTelemetry
             return (await QueryPowerLimitsAsync(executable, pci, token).ConfigureAwait(false)).GetValueOrDefault(pci);
         }
 
-        public async Task<NvidiaPowerWrite> WriteAsync(string pci, int watts, NvidiaPowerLease lease,
-            NvidiaPowerAuthority authority, CancellationToken token)
+        public async Task<NvidiaPowerWrite> WriteAsync(string pci, int watts, Func<Func<bool>, bool> permitStart,
+            CancellationToken token)
         {
-            if (authority.ConsentVersion != lease.ConsentVersion || !lease.Active || !NvidiaPowerControl.IsGpu(pci) || watts is < 1 or > 3000
+            if (_unsettledWrite || !NvidiaPowerControl.IsGpu(pci) || watts is < 1 or > 3000
                 || FindTool(requireSignature: true) is not { } executable)
                 return NvidiaPowerWrite.NotStarted;
             var result = await RunAsync(executable, ["-i", pci, "--power-limit", watts.ToString(CultureInfo.InvariantCulture)],
-                token, start => authority.TryBegin(lease, () => !token.IsCancellationRequested && start()))
-                .ConfigureAwait(false);
+                token, permitStart, () => _unsettledWrite = true).ConfigureAwait(false);
             return result.Started ? (result.ExitCode == 0 ? NvidiaPowerWrite.Completed : NvidiaPowerWrite.Unknown)
                 : NvidiaPowerWrite.NotStarted;
         }
@@ -147,16 +154,22 @@ internal static class NvidiaTelemetry
 
     private sealed record ToolReply(bool Started, int? ExitCode, string Output = "", string Error = "");
 
-    private static void EndOwnQuery(Process process)
+    private static bool EndOwnProcess(Process process, bool waitForExit)
     {
         try
         {
-            if (!process.HasExited) process.Kill();
+            if (process.HasExited) return true;
+            process.Kill();
         }
         catch (Exception error) when (error is Win32Exception or InvalidOperationException)
         {
-            // A one-shot query can exit between the two calls.
+            // The child can exit between the check and Kill.
         }
+        if (!waitForExit) return true;
+
+        // Do not allow another setter if this process cannot be confirmed stopped.
+        try { return process.WaitForExit(1000); }
+        catch (Exception error) when (error is Win32Exception or InvalidOperationException) { return false; }
     }
 
     private static string? FindTool(bool requireSignature = false)

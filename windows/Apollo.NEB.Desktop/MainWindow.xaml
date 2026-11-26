@@ -199,7 +199,7 @@
                 <Border Style="{StaticResource NebCard}" Padding="15" Margin="0,0,0,8">
                   <StackPanel Spacing="9">
                     <StackPanel Spacing="2">
-                      <TextBlock Text="{x:Bind Name}" FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap"
+                      <TextBlock Text="{x:Bind Name, Mode=OneWay}" FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap"
                                  AutomationProperties.AutomationId="NvidiaGpuName" />
                       <TextBlock Text="{x:Bind Pci}" Style="{StaticResource NebLabel}"
                                  AutomationProperties.AutomationId="NvidiaGpuPci" />
@@ -213,25 +213,81 @@
                       </Grid.ColumnDefinitions>
                       <StackPanel Spacing="3">
                         <TextBlock Text="Температура" Style="{StaticResource NebLabel}" />
-                        <TextBlock Text="{x:Bind Temperature}" FontWeight="SemiBold" TextWrapping="Wrap"
+                        <TextBlock Text="{x:Bind Temperature, Mode=OneWay}" FontWeight="SemiBold" TextWrapping="Wrap"
                                    AutomationProperties.AutomationId="NvidiaGpuTemperature" />
                       </StackPanel>
                       <StackPanel Grid.Column="1" Spacing="3">
                         <TextBlock Text="Загрузка" Style="{StaticResource NebLabel}" />
-                        <TextBlock Text="{x:Bind Utilization}" FontWeight="SemiBold" TextWrapping="Wrap"
+                        <TextBlock Text="{x:Bind Utilization, Mode=OneWay}" FontWeight="SemiBold" TextWrapping="Wrap"
                                    AutomationProperties.AutomationId="NvidiaGpuUtilization" />
                       </StackPanel>
                       <StackPanel Grid.Column="2" Spacing="3">
                         <TextBlock Text="VRAM" Style="{StaticResource NebLabel}" />
-                        <TextBlock Text="{x:Bind Memory}" FontWeight="SemiBold" TextWrapping="Wrap"
+                        <TextBlock Text="{x:Bind Memory, Mode=OneWay}" FontWeight="SemiBold" TextWrapping="Wrap"
                                    AutomationProperties.AutomationId="NvidiaGpuMemory" />
                       </StackPanel>
                       <StackPanel Grid.Column="3" Spacing="3">
-                        <TextBlock Text="Мощность" Style="{StaticResource NebLabel}" />
-                        <TextBlock Text="{x:Bind Watts}" FontWeight="SemiBold" TextWrapping="Wrap"
+                        <TextBlock Text="Потребление" Style="{StaticResource NebLabel}" />
+                        <TextBlock Text="{x:Bind Watts, Mode=OneWay}" FontWeight="SemiBold" TextWrapping="Wrap"
                                    AutomationProperties.AutomationId="NvidiaGpuPower" />
                       </StackPanel>
                     </Grid>
+                    <Border Background="#101B22" BorderBrush="#2C404D" BorderThickness="1"
+                            CornerRadius="9" Padding="11" Margin="0,3,0,0">
+                      <StackPanel Spacing="6">
+                        <Grid ColumnSpacing="8">
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                          </Grid.ColumnDefinitions>
+                          <StackPanel Spacing="3">
+                            <TextBlock Text="Лимит мощности" FontWeight="SemiBold" FontSize="15" />
+                            <TextBlock Text="Лимит действует на всю видеокарту." Style="{StaticResource NebLabel}" />
+                          </StackPanel>
+                          <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
+                            <TextBlock Text="Текущий" Style="{StaticResource NebLabel}" TextAlignment="Right" />
+                            <TextBlock Text="{x:Bind CurrentLimit, Mode=OneWay}" FontSize="19" FontWeight="SemiBold"
+                                       Foreground="{StaticResource NebMint}" TextAlignment="Right"
+                                       AutomationProperties.AutomationId="NvidiaGpuCurrentLimit" />
+                          </StackPanel>
+                        </Grid>
+
+                        <StackPanel Spacing="6" Visibility="{x:Bind PickerVisibility, Mode=OneWay}">
+                          <ComboBox Header="Профиль" ItemsSource="{x:Bind Presets, Mode=OneWay}"
+                                    SelectedItem="{x:Bind SelectedPreset, Mode=TwoWay}"
+                                    HorizontalAlignment="Stretch" MaxWidth="400"
+                                    Visibility="{x:Bind PresetsVisibility, Mode=OneWay}" IsEnabled="{x:Bind CanEdit, Mode=OneWay}"
+                                    AutomationProperties.AutomationId="NvidiaGpuPowerProfile">
+                            <ComboBox.ItemTemplate>
+                              <DataTemplate x:DataType="local:LocalPowerPreset">
+                                <TextBlock Text="{x:Bind Label}" TextWrapping="Wrap" />
+                              </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                          </ComboBox>
+                          <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                              <ColumnDefinition Width="*" />
+                              <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Header="Выбранный лимит, Вт" HorizontalAlignment="Left" MinWidth="104"
+                                     PlaceholderText="Вт" MaxLength="4" InputScope="Number"
+                                     IsEnabled="{x:Bind CanEdit, Mode=OneWay}"
+                                     Text="{x:Bind WattInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     AutomationProperties.AutomationId="NvidiaGpuPowerWatts" />
+                            <Button Grid.Column="1" VerticalAlignment="Bottom" Style="{StaticResource AccentButtonStyle}"
+                                    Content="{x:Bind ApplyText, Mode=OneWay}" IsEnabled="{x:Bind CanApply, Mode=OneWay}"
+                                    Click="ApplyLocalPower_Click" AutomationProperties.AutomationId="ApplyLocalNvidiaPower" />
+                          </Grid>
+                          <TextBlock Text="{x:Bind RangeText, Mode=OneWay}" Style="{StaticResource NebLabel}" />
+                        </StackPanel>
+                        <TextBlock Text="{x:Bind Help, Mode=OneWay}" Style="{StaticResource NebLabel}"
+                                   AutomationProperties.AutomationId="NvidiaGpuLocalPowerHelp" />
+                        <TextBlock Text="{x:Bind Outcome, Mode=OneWay}" Style="{StaticResource NebLabel}"
+                                   Visibility="{x:Bind OutcomeVisibility, Mode=OneWay}"
+                                   AutomationProperties.AutomationId="NvidiaGpuLocalPowerOutcome"
+                                   AutomationProperties.LiveSetting="Polite" />
+                      </StackPanel>
+                    </Border>
                   </StackPanel>
                 </Border>
               </DataTemplate>

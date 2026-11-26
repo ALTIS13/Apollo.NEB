@@ -29,7 +29,7 @@ internal sealed class FleetLink : IDisposable
     private readonly FleetCredentialStore _store;
     private readonly HttpClient _client;
     private readonly string _version;
-    private bool _legacyHardware;
+    private HardwareSchema _hardwareSchema;
 
     internal FleetLink(FleetCredentialStore store, string version, HttpMessageHandler? handler = null)
     {
@@ -110,6 +110,7 @@ internal sealed class FleetLink : IDisposable
             identity = new FleetIdentity(destination.AbsoluteUri, id, key, FleetStage.Pending);
             await _store.SaveAsync(identity, token).ConfigureAwait(false);
             Current = identity;
+            _hardwareSchema = HardwareSchema.FactoryDefault;
         }
 
         try
@@ -161,7 +162,7 @@ internal sealed class FleetLink : IDisposable
     {
         _store.Forget();
         Current = null;
-        _legacyHardware = false;
+        _hardwareSchema = HardwareSchema.FactoryDefault;
     }
 
     private async Task<IReadOnlySet<string>> PollAsync(FleetIdentity identity, IReadOnlyList<NvidiaGpuReading> devices,
@@ -175,25 +176,34 @@ internal sealed class FleetLink : IDisposable
                 return new FleetDevice(NvidiaTelemetry.CanonicalAddress(device.BusId), HardwareLabel(device.Name),
                     "nvidia", Sensor(device.Temperature, 160), Sensor(device.Watts, 3000),
                     Sensor(device.Utilization, 100), used > total ? null : used, total,
-                    !_legacyHardware && device.PowerLimit is { IsValid: true } limits ? limits : null);
+                    device.PowerLimit is { IsValid: true } limits ? limits : null);
             }).ToArray();
-        var supported = projected.Where(device => device.power_limit is not null).Select(device => device.id).ToHashSet();
-        bool advertise = allowPower && supported.Count > 0;
-        try
+        var schema = _hardwareSchema;
+        while (true)
         {
-            await SendPollAsync(identity, new FleetHardware(projected, advertise ? true : null), token)
-                .ConfigureAwait(false);
+            var rows = schema switch
+            {
+                HardwareSchema.Telemetry => projected.Select(device => device with { power_limit = null }).ToArray(),
+                HardwareSchema.Bounds => projected.Select(device => device.power_limit is { DefaultWatts: not null } limits
+                    ? device with { power_limit = limits with { DefaultWatts = null } } : device).ToArray(),
+                _ => projected,
+            };
+            var supported = rows.Where(device => device.power_limit is not null).Select(device => device.id).ToHashSet();
+            bool advertise = allowPower && supported.Count > 0;
+            try
+            {
+                await SendPollAsync(identity, new FleetHardware(rows, advertise ? true : null), token).ConfigureAwait(false);
+                _hardwareSchema = schema;
+                return advertise ? supported : new HashSet<string>();
+            }
+            catch (HttpRequestException error) when (supported.Count > 0 &&
+                error.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Conflict)
+            {
+                // Older panels may accept the original power bounds before falling back to telemetry alone.
+                schema = rows.Any(device => device.power_limit?.DefaultWatts is not null)
+                    ? HardwareSchema.Bounds : HardwareSchema.Telemetry;
+            }
         }
-        catch (HttpRequestException error) when (supported.Count > 0 &&
-            error.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Conflict)
-        {
-            // A legacy panel can reject the new optional keys. Preserve its original telemetry contract.
-            await SendPollAsync(identity, new FleetHardware(projected.Select(device => device with { power_limit = null })
-                .ToArray(), null), token).ConfigureAwait(false);
-            _legacyHardware = true;
-            advertise = false;
-        }
-        return advertise ? supported : new HashSet<string>();
     }
 
     private async Task SendPollAsync(FleetIdentity identity, FleetHardware hardware, CancellationToken token)
@@ -212,6 +222,8 @@ internal sealed class FleetLink : IDisposable
             || commands.ValueKind != JsonValueKind.Array || commands.GetArrayLength() > 16)
             throw InvalidReply();
     }
+
+    private enum HardwareSchema { FactoryDefault, Bounds, Telemetry }
 
     private sealed record FleetDevice(string id, string label, string vendor, double? edge, double? watts,
         double? utilization, long? memory_used_mib, long? memory_total_mib,

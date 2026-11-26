@@ -203,9 +203,11 @@ def _windows_pci(value):
 
 
 def _power_limits(value):
-    return (isinstance(value, dict) and value.keys() == {"min", "max", "current"}
+    fields = {"min", "max", "current"}
+    return (isinstance(value, dict) and value.keys() in (fields, fields | {"default_watts"})
             and all(type(watts) in (int, float) and 1 <= watts <= LIMITS["watts"] for watts in value.values())
-            and value["min"] <= value["current"] <= value["max"])
+            and value["min"] <= value["current"] <= value["max"]
+            and value["min"] <= value.get("default_watts", value["current"]) <= value["max"])
 
 
 def _power_permitted(snapshot, device_id, watts):

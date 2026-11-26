@@ -387,10 +387,26 @@
     <div class="dialog-head"><h2 id="gpu-power-title">Предел мощности GPU</h2><button type="button" class="quiet" data-close>Закрыть</button></div>
     <p id="gpu-power-device"></p>
     <form id="gpu-power-form">
+      <dl id="gpu-power-defaults" class="gpu-power-defaults" hidden>
+        <div><dt>Текущий предел</dt><dd id="gpu-power-current"></dd></div>
+        <div><dt>Штатный предел</dt><dd id="gpu-power-factory"></dd></div>
+      </dl>
+      <p id="gpu-power-range" class="subline"></p>
+      <fieldset id="gpu-power-presets" class="gpu-power-presets" hidden>
+        <legend>Быстрый выбор</legend>
+        <div class="gpu-power-preset-grid">
+          <button type="button" data-power-preset="desk" aria-pressed="false" hidden><span></span><small></small></button>
+          <button type="button" data-power-preset="80" aria-pressed="false" hidden><span></span><small></small></button>
+          <button type="button" data-power-preset="90" aria-pressed="false" hidden><span></span><small></small></button>
+          <button type="button" data-power-preset="100" aria-pressed="false" hidden><span></span><small></small></button>
+        </div>
+      </fieldset>
       <label>Новый предел, Вт
         <input id="gpu-power-watts" type="number" required step="1" aria-describedby="gpu-power-range">
       </label>
-      <p id="gpu-power-range" class="subline"></p>
+      <output id="gpu-power-preview" class="gpu-power-preview" for="gpu-power-watts" hidden></output>
+      <p class="subline">Предел действует на весь GPU. Потребление и загрузка отображаются отдельно.</p>
+      <p id="gpu-power-availability" class="form-message" role="status"></p>
       <button id="gpu-power-send" type="submit" class="primary">Отправить на ноду</button>
       <p id="gpu-power-message" class="form-message" role="status"></p>
     </form>

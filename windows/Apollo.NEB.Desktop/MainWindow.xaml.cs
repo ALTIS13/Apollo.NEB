@@ -8,9 +8,6 @@ using Launcher = Windows.System.Launcher;
 
 namespace Apollo.Neb.Desktop;
 
-public sealed record LocalGpuCard(string Name, string Pci, string Temperature, string Utilization,
-    string Memory, string Watts);
-
 public sealed partial class MainWindow : Window
 {
     private const string Missing = "—";
@@ -30,6 +27,7 @@ public sealed partial class MainWindow : Window
         _powerAuthority = NvidiaPowerAuthority.ForCurrentProcess();
         _powerControl = new(_powerAuthority, new NvidiaTelemetry.PowerAdapter());
         InitializeComponent();
+        LocalGpuCards.ItemsSource = _localGpus;
         _port = port;
         PortBox.Text = _port.ToString(CultureInfo.InvariantCulture);
         SetEndpoint();
@@ -49,6 +47,7 @@ public sealed partial class MainWindow : Window
             _shutdown.Cancel();
             _client.Dispose();
             if (_fleetActivity is not null) await _fleetActivity;
+            if (_localPowerActivity is not null) await _localPowerActivity;
             _fleet.Dispose();
             _shutdown.Dispose();
         };
@@ -139,6 +138,8 @@ public sealed partial class MainWindow : Window
             || AppWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Minimized }
                 && _fleet.Current?.Stage != FleetStage.Verified) return;
         _gpuReading = true;
+        long powerRevision = _powerReadRevision;
+        var sharedRead = _gpuRead;
         try
         {
             var sample = await ReadGpuAsync(_shutdown.Token);
@@ -150,7 +151,10 @@ public sealed partial class MainWindow : Window
                 NvidiaQueryState.ToolMissing => "Установленная утилита nvidia-smi не найдена.",
                 _ => "Локальные датчики NVIDIA недоступны.",
             };
-            LocalGpuCards.ItemsSource = sample.Devices.Select(DeviceCard).ToArray();
+            bool acceptLimit = powerRevision == _powerReadRevision
+                && (sharedRead is null || !ReferenceEquals(sharedRead, _priorPowerRead));
+            if (acceptLimit) _priorPowerRead = null;
+            RenderLocalGpuCards(sample, acceptLimit);
             await SendFleetAsync(sample);
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
@@ -158,15 +162,6 @@ public sealed partial class MainWindow : Window
         {
             _gpuReading = false;
         }
-    }
-
-    private static LocalGpuCard DeviceCard(NvidiaGpuReading value)
-    {
-        string memory = value.MemoryUsedMiB is null && value.MemoryTotalMiB is null
-            ? Missing
-            : $"{FormatCount(value.MemoryUsedMiB)} / {FormatCount(value.MemoryTotalMiB)} МиБ";
-        return new LocalGpuCard(value.Name, "PCI " + value.BusId, Format(value.Temperature, " °C"),
-            Format(value.Utilization, "%"), memory, Format(value.Watts, " Вт"));
     }
 
     private void Render(PublicStatus? value, string state)
@@ -189,10 +184,10 @@ public sealed partial class MainWindow : Window
             : "";
     }
 
-    private static string Format(double? value, string suffix) =>
+    internal static string Format(double? value, string suffix) =>
         value is double number ? number.ToString("0.##", DisplayCulture) + suffix : Missing;
 
-    private static string FormatCount(long? value) =>
+    internal static string FormatCount(long? value) =>
         value?.ToString("N0", DisplayCulture) ?? Missing;
 
     private static string FormatRate(double? rate) => rate switch

@@ -290,6 +290,7 @@ function renderStatus() {
   renderGroup(workers);
   $("profile-open").disabled = !state.online;
   for (const button of all("[data-limits], [data-profile], [data-discovery], [data-totp]")) button.disabled = !state.online;
+  if (state.view === "nodes") renderFleet();
 }
 
 function renderThermalSensors(devices, limits, farm) {
@@ -1397,9 +1398,9 @@ function clearFleet() {
   fleet.revokeId = null;
   gpuPower.target = gpuPower.request = null;
   $("gpu-power-form").reset();
-  text($("gpu-power-device"), "");
-  text($("gpu-power-range"), "");
-  text($("gpu-power-message"), "");
+  for (const id of ["gpu-power-device", "gpu-power-current", "gpu-power-factory", "gpu-power-preview",
+    "gpu-power-range", "gpu-power-availability", "gpu-power-message"]) text($(id), "");
+  for (const id of ["gpu-power-defaults", "gpu-power-presets", "gpu-power-preview"]) $(id).hidden = true;
   clearFleetInvite();
   $("fleet-enroll").reset();
   $("fleet-enroll").hidden = true;
@@ -1474,46 +1475,142 @@ function renderPreparedTargets() {
 }
 
 function powerRange(device) {
-  const {min, max, current} = device.power_limit || {};
+  const {min, max, current, default_watts: factory} = device.power_limit || {};
   if (![min, max, current].every(Number.isFinite) || min < 1 || max > 3000 || current < min || current > max
       || Math.ceil(min) > Math.floor(max)) return null;
-  return {min: Math.ceil(min), max: Math.floor(max), current};
+  const defaultWatts = Number.isFinite(factory) && factory >= min && factory <= max ? factory : null;
+  return {min: Math.ceil(min), max: Math.floor(max), current, reportedMin: min, defaultWatts};
 }
 
-function openGpuPower(node, device, range) {
-  if (gpuPower.request) return;
-  gpuPower.target = {node: node.id, gpu: device.id, ...range};
+function validGpuPowerWatts(range, watts) {
+  return Boolean(range) && Number.isSafeInteger(watts) && watts >= range.min && watts <= range.max;
+}
+
+function gpuPowerPresets(range) {
+  if (range.defaultWatts === null) return {};
+  const toWatts = percent => {
+    const nominal = range.defaultWatts * percent / 100;
+    const watts = Math.round(nominal);
+    return nominal >= range.reportedMin && validGpuPowerWatts(range, watts) ? watts : null;
+  };
+  const presets = {};
+  let desk = 60;
+  for (; desk < 100; desk++) {
+    const watts = toWatts(desk);
+    if (watts === null || watts >= range.defaultWatts) continue;
+    presets.desk = {percent: desk, watts};
+    break;
+  }
+  let previous = presets.desk?.watts ?? 0;
+  for (const percent of [80, 90]) {
+    const watts = toWatts(percent);
+    if (percent <= desk || watts === null || watts <= previous || watts >= range.defaultWatts) continue;
+    presets[String(percent)] = {percent, watts};
+    previous = watts;
+  }
+  if (Number.isInteger(range.defaultWatts)) presets["100"] = {percent: 100, watts: range.defaultWatts};
+  return presets;
+}
+
+function gpuLimitText(watts, factory) {
+  const reading = fmt(watts, "Вт", 1);
+  return factory === null ? reading : `${reading} · ${fmt(100 * watts / factory, "%", 1)} от штатного`;
+}
+
+function canQueueGpuPower(node) {
+  return state.mode === "app" && state.view === "nodes" && state.online && !state.authMutation
+    && fleet.fresh && !fleet.busy && location.protocol === "https:"
+    && node?.status === "online" && node.release?.platform === "windows" && node.hardware?.power_control === true
+    && !["queued", "sent", "claimed"].includes(node.power_job?.status);
+}
+
+function gpuPowerState(target) {
+  const node = inList(fleet.nodes).find(row => row.id === target.node);
+  const device = inList(node?.hardware?.devices).find(row => row.id === target.gpu);
+  const range = device ? powerRange(device) : null;
+  return {range, writable: Boolean(range) && canQueueGpuPower(node)};
+}
+
+function renderGpuPower() {
+  const target = gpuPower.target;
+  if (!target) return;
+  const {range: latest, writable} = gpuPowerState(target);
+  const range = target.range = latest || target.range;
+  const waiting = Boolean(gpuPower.request) || target.queued;
   const input = $("gpu-power-watts");
   input.min = range.min;
   input.max = range.max;
-  input.value = Math.min(range.max, Math.max(range.min, Math.round(range.current)));
-  $("gpu-power-send").disabled = false;
+  input.disabled = !writable || waiting;
+  const watts = input.valueAsNumber;
+  const valid = validGpuPowerWatts(range, watts);
+  input.setAttribute("aria-invalid", String(input.validity.badInput || (input.value !== "" && !valid)));
+  $("gpu-power-send").disabled = input.disabled || !valid;
+
+  const hasDefault = range.defaultWatts !== null;
+  const current = gpuLimitText(range.current, range.defaultWatts);
+  $("gpu-power-defaults").hidden = !hasDefault;
+  text($("gpu-power-current"), current);
+  text($("gpu-power-factory"), fmt(range.defaultWatts, "Вт", 1));
+  text($("gpu-power-range"), `${hasDefault ? "" : `Сейчас ${current}. `}Доступно ${range.min}–${range.max} Вт.`);
+
+  const presets = gpuPowerPresets(range);
+  $("gpu-power-presets").hidden = !Object.keys(presets).length;
+  for (const button of all("#gpu-power-presets [data-power-preset]")) {
+    const key = button.dataset.powerPreset;
+    const preset = presets[key];
+    button.hidden = !preset;
+    button.disabled = input.disabled;
+    button.setAttribute("aria-pressed", String(Boolean(preset) && preset.watts === watts));
+    if (!preset) continue;
+    button.dataset.watts = preset.watts;
+    const label = key === "desk" ? "За ПК · " : key === "100" ? "Штатный · " : "";
+    text(button.firstElementChild, `${label}${preset.percent} %`);
+    text(button.lastElementChild, fmt(preset.watts, "Вт", 0));
+  }
+  const preview = $("gpu-power-preview");
+  preview.hidden = !hasDefault;
+  text(preview, valid ? `Выбрано ${gpuLimitText(watts, range.defaultWatts)}.` : "Введите целое число в доступном диапазоне.");
+  text($("gpu-power-availability"), !waiting && !writable
+    ? "Для отправки нужны свежие данные ноды и разрешение на изменение лимита." : "");
+}
+
+function openGpuPower(node, device) {
+  const dialog = $("gpu-power-dialog");
+  if (gpuPower.request || dialog.open) return;
+  const target = {node: node.id, gpu: device.id};
+  const {range, writable} = gpuPowerState(target);
+  if (!writable) return;
+  gpuPower.target = {...target, range, queued: false};
+  const input = $("gpu-power-watts");
+  input.value = validGpuPowerWatts(range, range.current) ? range.current : "";
   text($("gpu-power-device"), `${safeLine(node.label)} · ${safeLine(device.label)}`);
-  text($("gpu-power-range"), `Сейчас ${fmt(range.current, "Вт", 1)}. Доступно ${range.min}–${range.max} Вт.`);
   text($("gpu-power-message"), "");
-  $("gpu-power-dialog").showModal();
-  input.focus();
+  renderGpuPower();
+  dialog.showModal();
+  ($("gpu-power-presets").querySelector("button:not([hidden]):not(:disabled)") || input).focus();
 }
 
 async function submitGpuPower(event) {
   event.preventDefault();
   const target = gpuPower.target;
+  if (gpuPower.request || !target || target.queued || !$("gpu-power-dialog").open) return;
   const watts = $("gpu-power-watts").valueAsNumber;
-  if (gpuPower.request || !target || !state.online || !fleet.fresh || state.mode !== "app"
-      || !Number.isSafeInteger(watts) || watts < target.min || watts > target.max) return;
+  const {range, writable} = gpuPowerState(target);
+  if (!writable || !validGpuPowerWatts(range, watts)) {
+    renderGpuPower();
+    return;
+  }
   const seq = gpuPower.request = {};
   const visible = () => $("gpu-power-dialog").open && gpuPower.target === target;
-  const button = $("gpu-power-send");
   const msg = $("gpu-power-message");
-  button.disabled = true;
+  renderGpuPower();
   text(msg, "Ставим команду в очередь…");
-  let queued = false;
   try {
     const data = await api("fleet/power", {node: target.node, gpu: target.gpu, watts});
     if (gpuPower.request !== seq) return;
     if (data.status !== "queued" || data.gpu !== target.gpu || data.watts !== watts) throw new Error();
-    queued = true;
-    if (visible()) text(msg, "Команда принята. Результат появится в карточке ноды.");
+    target.queued = true;
+    if (visible()) text(msg, "Команда в очереди. Результат появится в карточке ноды.");
   } catch (error) {
     if (gpuPower.request !== seq) return;
     if (error.status === 401) return showLogin(true);
@@ -1522,7 +1619,7 @@ async function submitGpuPower(event) {
     if (gpuPower.request === seq) await loadFleet();
     if (gpuPower.request === seq) {
       gpuPower.request = null;
-      if (visible()) button.disabled = queued;
+      if (visible()) renderGpuPower();
     }
   }
 }
@@ -1542,7 +1639,7 @@ function nodeGpuCards(devices, atlas = false, node = null) {
     const readings = create("dl", undefined, "node-gpu-readings");
     const vram = Number.isFinite(device.memory_used_mib) && Number.isFinite(device.memory_total_mib)
       ? `${n(device.memory_used_mib, 0)} / ${n(device.memory_total_mib, 0)} МиБ` : "—";
-    const metrics = [["Ядро", temperature(device.edge)], ["Мощность", fmt(device.watts, "Вт", 1)]];
+    const metrics = [["Ядро", temperature(device.edge)], ["Потребление", fmt(device.watts, "Вт", 1)]];
     metrics.push(...(atlas ? [["Хешрейт", rate(device.rate_hs)], ["Hotspot", temperature(device.hot)]]
       : [["Загрузка GPU", fmt(device.utilization, "%", 0)], ["Память", vram]]));
     for (const [label, reading] of metrics) {
@@ -1554,13 +1651,17 @@ function nodeGpuCards(devices, atlas = false, node = null) {
     const power = powerRange(device);
     if (power) {
       const controls = create("div", undefined, "node-gpu-power");
-      controls.append(create("span", `Предел ${fmt(power.current, "Вт", 1)}`, "subline"));
+      controls.append(create("span", `Предел ${gpuLimitText(power.current, power.defaultWatts)}`, "subline"));
       if (node?.hardware?.power_control === true && location.protocol === "https:") {
-        const apply = actionButton("Изменить предел", () => openGpuPower(node, device, power), "quiet");
-        const active = ["queued", "sent", "claimed"].includes(node.power_job?.status);
+        const apply = actionButton("Изменить предел", () => openGpuPower(node, device), "quiet");
         apply.dataset.controlKey = `${node.id}:power:${device.id}`;
-        apply.disabled = !fleet.fresh || fleet.busy || !state.online || active;
+        apply.disabled = !canQueueGpuPower(node);
         controls.append(apply);
+      } else if (node) {
+        const hint = location.protocol === "https:"
+          ? "В Apollo.NEB Desktop на этом ПК разрешите изменение лимита для текущей сессии. Нужны права администратора."
+          : "Для управления откройте панель по HTTPS.";
+        controls.append(create("p", hint, "node-gpu-power-help subline"));
       }
       gpu.append(controls);
     }
@@ -1598,6 +1699,7 @@ function renderAtlasNode(atlas) {
 
 function renderFleet() {
   renderPreparedTargets();
+  renderGpuPower();
   const rows = inList(fleet.nodes);
   $("fleet-enroll").hidden = !fleet.fresh;
   $("fleet-label").disabled = fleet.busy;
@@ -1605,7 +1707,7 @@ function renderFleet() {
   $("fleet-refresh").disabled = fleet.loading || fleet.busy;
   if (fleet.fresh) text($("fleet-status"), rows.length ? `Нод: ${rows.length}. Команды не повторяются автоматически.` : "Подключённых нод пока нет.");
   else if (fleet.nodes) text($("fleet-status"), "Связь с реестром потеряна. Показаны последние полученные данные; команды недоступны.");
-  const key = JSON.stringify([fleet.fresh, fleet.busy, rows.map(({last_seen, ...node}) => node)]);
+  const key = JSON.stringify([state.online, state.authMutation, fleet.fresh, fleet.busy, rows.map(({last_seen, ...node}) => node)]);
   if (key === fleet.key) {
     for (const time of $("node-list").querySelectorAll("[data-node-time]")) {
       const node = rows.find(node => node.id === time.dataset.nodeTime);
@@ -2051,9 +2153,24 @@ $("release-confirm-cancel").addEventListener("click", () => {
   $("release-apply").focus();
 });
 $("release-confirm-submit").addEventListener("click", installRelease);
+$("gpu-power-watts").addEventListener("input", renderGpuPower);
+for (const button of all("#gpu-power-presets [data-power-preset]")) {
+  button.addEventListener("click", () => {
+    if (!gpuPower.target || button.hidden || button.disabled) return;
+    $("gpu-power-watts").value = button.dataset.watts;
+    renderGpuPower();
+  });
+}
 $("gpu-power-form").addEventListener("submit", submitGpuPower);
 $("gpu-power-dialog").addEventListener("close", () => {
+  if ($("gpu-power-dialog").open) return;
+  const target = gpuPower.target;
   gpuPower.target = null;
+  if (target && state.mode === "app" && state.view === "nodes" && document.activeElement === document.body) {
+    const key = `${target.node}:power:${target.gpu}`;
+    const trigger = all("#node-list button[data-control-key]").find(button => button.dataset.controlKey === key && !button.disabled);
+    (trigger || document.querySelector("[data-view='nodes']"))?.focus({preventScroll: true});
+  }
 });
 $("fleet-refresh").addEventListener("click", loadFleet);
 $("fleet-copy-key").addEventListener("click", () => {
@@ -2126,11 +2243,8 @@ window.addEventListener("offline", () => {
   if (state.mode === "app") {
     state.online = false;
     connection("Нет связи", "warn");
+    if (state.view === "nodes") fleet.fresh = false;
     renderStatus();
-    if (state.view === "nodes") {
-      fleet.fresh = false;
-      renderFleet();
-    }
   }
 });
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 4000);

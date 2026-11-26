@@ -10,7 +10,9 @@ namespace Apollo.Neb.Desktop;
 internal sealed record NvidiaPowerLimit(
     [property: JsonPropertyName("current")] double Current,
     [property: JsonPropertyName("min")] double Min,
-    [property: JsonPropertyName("max")] double Max)
+    [property: JsonPropertyName("max")] double Max,
+    [property: JsonPropertyName("default_watts"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    double? DefaultWatts = null)
 {
     internal bool IsValid => Min >= 1 && Min <= Current && Current <= Max && Max <= 3000;
 }
@@ -79,7 +81,7 @@ internal interface INvidiaPowerAdapter
 {
     bool Available { get; }
     Task<NvidiaPowerLimit?> ReadAsync(string pci, CancellationToken token);
-    Task<NvidiaPowerWrite> WriteAsync(string pci, int watts, NvidiaPowerLease lease, NvidiaPowerAuthority authority,
+    Task<NvidiaPowerWrite> WriteAsync(string pci, int watts, Func<Func<bool>, bool> permitStart,
         CancellationToken token);
 }
 
@@ -90,8 +92,10 @@ internal sealed class NvidiaPowerControl(NvidiaPowerAuthority authority, INvidia
     private static readonly Regex JobId = new(@"\A[0-9a-f]{32}\z");
     private static readonly Regex CanonicalPci = new(@"\A[0-9a-f]{8}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\z");
     private readonly Dictionary<string, long> _attempted = new();
+    private readonly SemaphoreSlim _operation = new(1, 1);
 
     internal NvidiaPowerAttempt? LastAttempt { get; private set; }
+    internal bool CanApplyLocally => authority.Elevated && adapter.Available;
     internal long? OfferedConsent =>
         authority.ConsentVersion is long version && adapter.Available ? version : null;
 
@@ -100,10 +104,35 @@ internal sealed class NvidiaPowerControl(NvidiaPowerAuthority authority, INvidia
 
     internal void Reset() => LastAttempt = null;
 
+    internal async Task<NvidiaPowerAttempt> ApplyLocalAsync(string pci, int watts, CancellationToken token)
+    {
+        if (token.IsCancellationRequested || !IsGpu(pci) || watts is < 1 or > 3000 || !CanApplyLocally)
+            return new("refused", null, false);
+        if (!_operation.Wait(0)) return new("busy", null, false);
+        try
+        {
+            var result = await ApplyAsync(pci, watts, () => authority.Elevated,
+                start => authority.Elevated && start(), token).ConfigureAwait(false);
+            return result with { Confirmed = result.Phase == "applied" };
+        }
+        finally { _operation.Release(); }
+    }
+
     internal async Task RunAsync(IReadOnlySet<string> advertised, long consentVersion,
         Func<object?, CancellationToken, Task<JsonDocument>> exchange, CancellationToken token)
     {
-        if (authority.ConsentVersion != consentVersion) return;
+        if (authority.ConsentVersion != consentVersion || !_operation.Wait(0)) return;
+        try { await RunRemoteAsync(advertised, consentVersion, exchange, token).ConfigureAwait(false); }
+        finally
+        {
+            authority.EndAttempt();
+            _operation.Release();
+        }
+    }
+
+    private async Task RunRemoteAsync(IReadOnlySet<string> advertised, long consentVersion,
+        Func<object?, CancellationToken, Task<JsonDocument>> exchange, CancellationToken token)
+    {
         Job? job;
         try
         {
@@ -133,7 +162,10 @@ internal sealed class NvidiaPowerControl(NvidiaPowerAuthority authority, INvidia
 
         try
         {
-            var measured = await ApplyAsync(job, lease, token).ConfigureAwait(false);
+            var measured = await ApplyAsync(job.Gpu, job.Watts,
+                () => authority.ConsentVersion == lease.ConsentVersion && lease.Active,
+                start => authority.TryBegin(lease, start), token,
+                () => LastAttempt = new("unknown", null, false)).ConfigureAwait(false);
             LastAttempt = new("unknown", measured.ObservedWatts, false);
             using var receipt = await exchange(new
             {
@@ -142,7 +174,6 @@ internal sealed class NvidiaPowerControl(NvidiaPowerAuthority authority, INvidia
             if (IsOk(receipt.RootElement)) LastAttempt = measured with { Confirmed = true };
         }
         catch (Exception error) when (IsUnconfirmed(error, token)) { }
-        finally { authority.EndAttempt(); }
     }
 
     private static bool TryClaimLease(JsonElement value, out long lease)
@@ -154,23 +185,35 @@ internal sealed class NvidiaPowerControl(NvidiaPowerAuthority authority, INvidia
             && until.TryGetInt64(out lease) && lease is >= 1 and <= 253402300799;
     }
 
-    private async Task<NvidiaPowerAttempt> ApplyAsync(Job job, NvidiaPowerLease lease, CancellationToken token)
+    private async Task<NvidiaPowerAttempt> ApplyAsync(string pci, int watts, Func<bool> authorized,
+        Func<Func<bool>, bool> permitStart, CancellationToken token, Action? onStarted = null)
     {
-        if (authority.ConsentVersion != lease.ConsentVersion || !lease.Active) return new("refused", null, false);
-        var before = await adapter.ReadAsync(job.Gpu, token).ConfigureAwait(false);
-        if (before is not { IsValid: true }) return new("refused", null, false);
-        if (job.Watts < before.Min || job.Watts > before.Max || authority.ConsentVersion != lease.ConsentVersion || !lease.Active)
-            return new("refused", before.Current, false);
-        if (before.Current == job.Watts) return new("applied", before.Current, false);
+        bool started = false;
+        try
+        {
+            if (token.IsCancellationRequested || !authorized()) return new("refused", null, false);
+            var before = await adapter.ReadAsync(pci, token).ConfigureAwait(false);
+            if (before is not { IsValid: true }) return new("refused", null, false);
+            if (watts < before.Min || watts > before.Max || token.IsCancellationRequested || !authorized())
+                return new("refused", before.Current, false);
+            if (before.Current == watts) return new("applied", before.Current, false);
 
-        LastAttempt = new("unknown", null, false);
-        var result = await adapter.WriteAsync(job.Gpu, job.Watts, lease, authority, token).ConfigureAwait(false);
-        if (result == NvidiaPowerWrite.NotStarted) return new("refused", before.Current, false);
-
-        var after = await adapter.ReadAsync(job.Gpu, token).ConfigureAwait(false);
-        double? observed = after is { IsValid: true } ? after.Current : null;
-        return new(result == NvidiaPowerWrite.Completed && observed == job.Watts ? "applied" : "unknown",
-            observed, false);
+            var result = await adapter.WriteAsync(pci, watts, start => permitStart(() =>
+            {
+                if (token.IsCancellationRequested || !start()) return false;
+                started = true;
+                onStarted?.Invoke();
+                return true;
+            }), token).ConfigureAwait(false);
+            if (result == NvidiaPowerWrite.NotStarted) return new("refused", before.Current, false);
+            var after = await adapter.ReadAsync(pci, token).ConfigureAwait(false);
+            double? observed = after is { IsValid: true } ? after.Current : null;
+            return new(result == NvidiaPowerWrite.Completed && observed == watts ? "applied" : "unknown", observed, false);
+        }
+        catch (Exception error) when (error is OperationCanceledException or IOException or InvalidDataException)
+        {
+            return new(started ? "unknown" : "refused", null, false);
+        }
     }
 
     private static bool IsOk(JsonElement value) =>
